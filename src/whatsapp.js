@@ -378,11 +378,11 @@ export async function startSession(id) {
          * Outgoing messages nekeliauja
          * atgal į n8n, kad nekiltų loopas.
          */
-        if (
-          message.key.fromMe
-        ) {
-          continue;
-        }
+        // if (
+        //   message.key.fromMe
+        // ) {
+        //   continue;
+        // }
 
         const chatId =
           message.key.remoteJid;
