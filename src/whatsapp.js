@@ -25,12 +25,102 @@ function getTextFromMessage(message) {
     message?.extendedTextMessage?.text ||
     message?.imageMessage?.caption ||
     message?.videoMessage?.caption ||
+    message?.documentMessage?.caption ||
     ""
   );
 }
 
+function getMessageType(message) {
+  if (!message) {
+    return "unknown";
+  }
+
+  if (message.conversation) {
+    return "text";
+  }
+
+  if (message.extendedTextMessage) {
+    return "text";
+  }
+
+  if (message.imageMessage) {
+    return "image";
+  }
+
+  if (message.videoMessage) {
+    return "video";
+  }
+
+  if (message.audioMessage) {
+    return "audio";
+  }
+
+  if (message.documentMessage) {
+    return "document";
+  }
+
+  if (message.stickerMessage) {
+    return "sticker";
+  }
+
+  if (message.locationMessage) {
+    return "location";
+  }
+
+  if (message.contactMessage) {
+    return "contact";
+  }
+
+  if (message.reactionMessage) {
+    return "reaction";
+  }
+
+  return Object.keys(message)[0] || "unknown";
+}
+
+function getMediaInfo(message) {
+  const media =
+    message?.imageMessage ||
+    message?.videoMessage ||
+    message?.audioMessage ||
+    message?.documentMessage ||
+    message?.stickerMessage ||
+    null;
+
+  if (!media) {
+    return null;
+  }
+
+  return {
+    mimetype:
+      media.mimetype ||
+      null,
+
+    fileName:
+      media.fileName ||
+      null,
+
+    fileLength:
+      media.fileLength?.toString?.() ||
+      media.fileLength ||
+      null,
+
+    caption:
+      media.caption ||
+      null,
+
+    seconds:
+      media.seconds ||
+      null,
+  };
+}
+
 async function sendToN8n(event) {
   if (!N8N_WEBHOOK_URL) {
+    console.warn(
+      "N8N_WEBHOOK_URL is not configured"
+    );
+
     return;
   }
 
@@ -39,18 +129,32 @@ async function sendToN8n(event) {
       N8N_WEBHOOK_URL,
       {
         method: "POST",
+
         headers: {
-          "Content-Type": "application/json",
+          "Content-Type":
+            "application/json",
         },
+
         body: JSON.stringify(event),
       }
     );
 
     if (!response.ok) {
+      const responseBody =
+        await response.text();
+
       console.error(
-        `n8n webhook returned ${response.status}`
+        "n8n webhook failed:",
+        response.status,
+        responseBody
       );
+
+      return;
     }
+
+    console.log(
+      `[n8n] event delivered: ${event.event}`
+    );
   } catch (error) {
     console.error(
       "n8n webhook error:",
@@ -73,40 +177,55 @@ export function getSessions() {
 }
 
 export async function startSession(id) {
-  const existing = sessions.get(id);
+  const existing =
+    sessions.get(id);
 
   if (existing?.socket) {
     return existing;
   }
 
-  const authPath = path.join(
-    DATA_DIR,
-    id
-  );
+  const authPath =
+    path.join(
+      DATA_DIR,
+      id
+    );
 
   const {
     state,
     saveCreds,
-  } = await useMultiFileAuthState(
-    authPath
-  );
+  } =
+    await useMultiFileAuthState(
+      authPath
+    );
 
   const session = {
     id,
+
     socket: null,
+
     qr: null,
+
     status: "STARTING",
   };
 
-  sessions.set(id, session);
+  sessions.set(
+    id,
+    session
+  );
 
-  const socket = makeWASocket({
-    auth: state,
-    markOnlineOnConnect: false,
-    printQRInTerminal: false,
-  });
+  const socket =
+    makeWASocket({
+      auth: state,
 
-  session.socket = socket;
+      markOnlineOnConnect:
+        false,
+
+      printQRInTerminal:
+        false,
+    });
+
+  session.socket =
+    socket;
 
   socket.ev.on(
     "creds.update",
@@ -124,34 +243,52 @@ export async function startSession(id) {
 
       if (qr) {
         session.qr =
-          await QRCode.toDataURL(qr);
+          await QRCode.toDataURL(
+            qr
+          );
 
-        session.status = "QR";
+        session.status =
+          "QR";
 
         console.log(
           `[${id}] QR ready`
         );
       }
 
-      if (connection === "open") {
+      if (
+        connection === "open"
+      ) {
         session.qr = null;
+
         session.status =
           "CONNECTED";
 
         console.log(
           `[${id}] WhatsApp connected`
         );
+
+        await sendToN8n({
+          event:
+            "session.connected",
+
+          session:
+            id,
+
+          timestamp:
+            Date.now(),
+        });
       }
 
-      if (connection === "close") {
+      if (
+        connection === "close"
+      ) {
         const statusCode =
           lastDisconnect?.error instanceof Boom
-            ? lastDisconnect.error.output
-                .statusCode
-            : lastDisconnect?.error?.output
-                ?.statusCode;
+            ? lastDisconnect.error.output.statusCode
+            : lastDisconnect?.error?.output?.statusCode;
 
-        session.socket = null;
+        session.socket =
+          null;
 
         if (
           statusCode ===
@@ -164,6 +301,17 @@ export async function startSession(id) {
             `[${id}] WhatsApp logged out`
           );
 
+          await sendToN8n({
+            event:
+              "session.logged_out",
+
+            session:
+              id,
+
+            timestamp:
+              Date.now(),
+          });
+
           return;
         }
 
@@ -174,18 +322,36 @@ export async function startSession(id) {
           `[${id}] reconnecting...`
         );
 
-        setTimeout(async () => {
-          sessions.delete(id);
+        await sendToN8n({
+          event:
+            "session.reconnecting",
 
-          try {
-            await startSession(id);
-          } catch (error) {
-            console.error(
-              `[${id}] reconnect failed:`,
-              error
+          session:
+            id,
+
+          timestamp:
+            Date.now(),
+        });
+
+        setTimeout(
+          async () => {
+            sessions.delete(
+              id
             );
-          }
-        }, 2000);
+
+            try {
+              await startSession(
+                id
+              );
+            } catch (error) {
+              console.error(
+                `[${id}] reconnect failed:`,
+                error
+              );
+            }
+          },
+          2000
+        );
       }
     }
   );
@@ -196,15 +362,27 @@ export async function startSession(id) {
       messages,
       type,
     }) => {
-      if (type !== "notify") {
+      if (
+        type !== "notify"
+      ) {
         return;
       }
 
-      for (const message of messages) {
-        // Prevent outgoing messages from triggering reply loops.
-        // if (message.key.fromMe) {
-        //   continue;
-        // }
+      for (
+        const message
+        of messages
+      ) {
+        /*
+         * Labai svarbu.
+         *
+         * Outgoing messages nekeliauja
+         * atgal į n8n, kad nekiltų loopas.
+         */
+        if (
+          message.key.fromMe
+        ) {
+          continue;
+        }
 
         const chatId =
           message.key.remoteJid;
@@ -214,16 +392,27 @@ export async function startSession(id) {
         }
 
         const isGroup =
-          chatId.endsWith("@g.us");
+          chatId.endsWith(
+            "@g.us"
+          );
 
         const participant =
-          message.key.participant ||
+          message.key
+            .participant ||
           null;
 
         const participantAlt =
-          message.key.participantAlt ||
+          message.key
+            .participantAlt ||
           null;
 
+        /*
+         * Grupėje:
+         * sender = žmogus.
+         *
+         * Private chat:
+         * sender = chatId.
+         */
         const sender =
           participantAlt ||
           participant ||
@@ -234,23 +423,57 @@ export async function startSession(id) {
             message.message
           );
 
+        const messageType =
+          getMessageType(
+            message.message
+          );
+
+        const media =
+          getMediaInfo(
+            message.message
+          );
+
         const event = {
-          event: "message",
-          session: id,
+          event:
+            "message.received",
+
+          session:
+            id,
+
+          timestamp:
+            Date.now(),
+
           payload: {
             id:
               message.key.id ||
               null,
+
             chatId,
+
             sender,
+
             participant,
+
             participantAlt,
-            fromMe: false,
+
+            fromMe:
+              false,
+
             isGroup,
+
             pushName:
               message.pushName ||
               null,
+
             body,
+
+            type:
+              messageType,
+
+            hasMedia:
+              Boolean(media),
+
+            media,
           },
         };
 
@@ -259,10 +482,13 @@ export async function startSession(id) {
           event.payload.pushName ||
             sender,
           ":",
-          body
+          body ||
+            `[${messageType}]`
         );
 
-        await sendToN8n(event);
+        await sendToN8n(
+          event
+        );
       }
     }
   );
@@ -276,12 +502,15 @@ export async function sendText({
   text,
 }) {
   const session =
-    sessions.get(sessionId);
+    sessions.get(
+      sessionId
+    );
 
   if (
     !session ||
     !session.socket ||
-    session.status !== "CONNECTED"
+    session.status !==
+      "CONNECTED"
   ) {
     throw new Error(
       "Session is not connected"
@@ -312,7 +541,11 @@ export async function sendText({
 }
 
 export async function restoreSessions() {
-  if (!fs.existsSync(DATA_DIR)) {
+  if (
+    !fs.existsSync(
+      DATA_DIR
+    )
+  ) {
     return;
   }
 
@@ -320,12 +553,18 @@ export async function restoreSessions() {
     fs.readdirSync(
       DATA_DIR,
       {
-        withFileTypes: true,
+        withFileTypes:
+          true,
       }
     );
 
-  for (const entry of entries) {
-    if (!entry.isDirectory()) {
+  for (
+    const entry
+    of entries
+  ) {
+    if (
+      !entry.isDirectory()
+    ) {
       continue;
     }
 
