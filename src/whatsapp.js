@@ -13,33 +13,115 @@ import {
   N8N_WEBHOOK_URL,
 } from "./config.js";
 
+
 fs.mkdirSync(DATA_DIR, {
   recursive: true,
 });
 
+
 const sessions = new Map();
 
-function getTextFromMessage(message) {
+
+/**
+ * ---------------------------------------------------------
+ * GROUP NAME CACHE
+ * ---------------------------------------------------------
+ *
+ * Kad neklaustume WhatsApp groupMetadata()
+ * ant kiekvienos žinutės.
+ */
+
+const groupNameCache = new Map();
+
+const GROUP_CACHE_TTL =
+  10 * 60 * 1000;
+
+
+async function getGroupName(
+  socket,
+  chatId
+) {
+  const cached =
+    groupNameCache.get(chatId);
+
+  if (
+    cached &&
+    Date.now() < cached.expiresAt
+  ) {
+    return cached.name;
+  }
+
+  try {
+    const metadata =
+      await socket.groupMetadata(
+        chatId
+      );
+
+    const name =
+      metadata?.subject ||
+      null;
+
+    groupNameCache.set(
+      chatId,
+      {
+        name,
+        expiresAt:
+          Date.now() +
+          GROUP_CACHE_TTL,
+      }
+    );
+
+    return name;
+  } catch (error) {
+    console.error(
+      `[group] Could not get name for ${chatId}:`,
+      error.message
+    );
+
+    return null;
+  }
+}
+
+
+/**
+ * ---------------------------------------------------------
+ * MESSAGE HELPERS
+ * ---------------------------------------------------------
+ */
+
+function getTextFromMessage(
+  message
+) {
   return (
     message?.conversation ||
-    message?.extendedTextMessage?.text ||
-    message?.imageMessage?.caption ||
-    message?.videoMessage?.caption ||
-    message?.documentMessage?.caption ||
+    message
+      ?.extendedTextMessage
+      ?.text ||
+    message
+      ?.imageMessage
+      ?.caption ||
+    message
+      ?.videoMessage
+      ?.caption ||
+    message
+      ?.documentMessage
+      ?.caption ||
     ""
   );
 }
 
-function getMessageType(message) {
+
+function getMessageType(
+  message
+) {
   if (!message) {
     return "unknown";
   }
 
-  if (message.conversation) {
-    return "text";
-  }
-
-  if (message.extendedTextMessage) {
+  if (
+    message.conversation ||
+    message.extendedTextMessage
+  ) {
     return "text";
   }
 
@@ -75,10 +157,16 @@ function getMessageType(message) {
     return "reaction";
   }
 
-  return Object.keys(message)[0] || "unknown";
+  return (
+    Object.keys(message)[0] ||
+    "unknown"
+  );
 }
 
-function getMediaInfo(message) {
+
+function getMediaInfo(
+  message
+) {
   const media =
     message?.imageMessage ||
     message?.videoMessage ||
@@ -101,7 +189,8 @@ function getMediaInfo(message) {
       null,
 
     fileLength:
-      media.fileLength?.toString?.() ||
+      media.fileLength
+        ?.toString?.() ||
       media.fileLength ||
       null,
 
@@ -115,7 +204,16 @@ function getMediaInfo(message) {
   };
 }
 
-async function sendToN8n(event) {
+
+/**
+ * ---------------------------------------------------------
+ * N8N
+ * ---------------------------------------------------------
+ */
+
+async function sendToN8n(
+  event
+) {
   if (!N8N_WEBHOOK_URL) {
     console.warn(
       "N8N_WEBHOOK_URL is not configured"
@@ -125,58 +223,83 @@ async function sendToN8n(event) {
   }
 
   try {
-    const response = await fetch(
-      N8N_WEBHOOK_URL,
-      {
-        method: "POST",
+    const response =
+      await fetch(
+        N8N_WEBHOOK_URL,
+        {
+          method: "POST",
 
-        headers: {
-          "Content-Type":
-            "application/json",
-        },
+          headers: {
+            "Content-Type":
+              "application/json",
+          },
 
-        body: JSON.stringify(event),
-      }
-    );
+          body:
+            JSON.stringify(
+              event
+            ),
+        }
+      );
 
     if (!response.ok) {
-      const responseBody =
+      const body =
         await response.text();
 
       console.error(
-        "n8n webhook failed:",
-        response.status,
-        responseBody
+        `[n8n] ${response.status}:`,
+        body
       );
 
       return;
     }
 
     console.log(
-      `[n8n] event delivered: ${event.event}`
+      `[n8n] delivered: ${event.event}`
     );
   } catch (error) {
     console.error(
-      "n8n webhook error:",
+      "[n8n] webhook error:",
       error.message
     );
   }
 }
 
-export function getSession(id) {
+
+/**
+ * ---------------------------------------------------------
+ * SESSION GETTERS
+ * ---------------------------------------------------------
+ */
+
+export function getSession(
+  id
+) {
   return sessions.get(id);
 }
+
 
 export function getSessions() {
   return Array.from(
     sessions.entries()
-  ).map(([id, session]) => ({
-    id,
-    status: session.status,
-  }));
+  ).map(
+    ([id, session]) => ({
+      id,
+      status:
+        session.status,
+    })
+  );
 }
 
-export async function startSession(id) {
+
+/**
+ * ---------------------------------------------------------
+ * START SESSION
+ * ---------------------------------------------------------
+ */
+
+export async function startSession(
+  id
+) {
   const existing =
     sessions.get(id);
 
@@ -184,11 +307,13 @@ export async function startSession(id) {
     return existing;
   }
 
+
   const authPath =
     path.join(
       DATA_DIR,
       id
     );
+
 
   const {
     state,
@@ -198,20 +323,29 @@ export async function startSession(id) {
       authPath
     );
 
+
   const session = {
     id,
-
     socket: null,
-
     qr: null,
-
     status: "STARTING",
   };
+
 
   sessions.set(
     id,
     session
   );
+
+
+  /**
+   * SVARBU:
+   * čia paliekam paprastą veikiančią
+   * makeWASocket konfiguraciją.
+   *
+   * Jokio cachedGroupMetadata,
+   * jokio pairing eksperimento.
+   */
 
   const socket =
     makeWASocket({
@@ -224,13 +358,22 @@ export async function startSession(id) {
         false,
     });
 
+
   session.socket =
     socket;
+
 
   socket.ev.on(
     "creds.update",
     saveCreds
   );
+
+
+  /**
+   * -------------------------------------------------------
+   * CONNECTION
+   * -------------------------------------------------------
+   */
 
   socket.ev.on(
     "connection.update",
@@ -240,6 +383,7 @@ export async function startSession(id) {
         qr,
         lastDisconnect,
       } = update;
+
 
       if (qr) {
         session.qr =
@@ -255,10 +399,12 @@ export async function startSession(id) {
         );
       }
 
+
       if (
         connection === "open"
       ) {
-        session.qr = null;
+        session.qr =
+          null;
 
         session.status =
           "CONNECTED";
@@ -266,6 +412,7 @@ export async function startSession(id) {
         console.log(
           `[${id}] WhatsApp connected`
         );
+
 
         await sendToN8n({
           event:
@@ -279,20 +426,31 @@ export async function startSession(id) {
         });
       }
 
+
       if (
         connection === "close"
       ) {
         const statusCode =
-          lastDisconnect?.error instanceof Boom
-            ? lastDisconnect.error.output.statusCode
-            : lastDisconnect?.error?.output?.statusCode;
+          lastDisconnect?.error
+            instanceof Boom
+            ? lastDisconnect
+                .error
+                .output
+                .statusCode
+            : lastDisconnect
+                ?.error
+                ?.output
+                ?.statusCode;
+
 
         session.socket =
           null;
 
+
         if (
           statusCode ===
-          DisconnectReason.loggedOut
+          DisconnectReason
+            .loggedOut
         ) {
           session.status =
             "LOGGED_OUT";
@@ -300,6 +458,7 @@ export async function startSession(id) {
           console.log(
             `[${id}] WhatsApp logged out`
           );
+
 
           await sendToN8n({
             event:
@@ -315,12 +474,15 @@ export async function startSession(id) {
           return;
         }
 
+
         session.status =
           "RECONNECTING";
+
 
         console.log(
           `[${id}] reconnecting...`
         );
+
 
         await sendToN8n({
           event:
@@ -332,6 +494,7 @@ export async function startSession(id) {
           timestamp:
             Date.now(),
         });
+
 
         setTimeout(
           async () => {
@@ -356,6 +519,18 @@ export async function startSession(id) {
     }
   );
 
+
+  /**
+   * -------------------------------------------------------
+   * MESSAGES
+   * -------------------------------------------------------
+   *
+   * Siunčiam į n8n ir received,
+   * ir sent žinutes.
+   *
+   * n8n pats nuspręs ką daryti.
+   */
+
   socket.ev.on(
     "messages.upsert",
     async ({
@@ -368,74 +543,122 @@ export async function startSession(id) {
         return;
       }
 
+
       for (
         const message
         of messages
       ) {
-        /*
-         * Labai svarbu.
-         *
-         * Outgoing messages nekeliauja
-         * atgal į n8n, kad nekiltų loopas.
-         */
-        // if (
-        //   message.key.fromMe
-        // ) {
-        //   continue;
-        // }
-
         const chatId =
-          message.key.remoteJid;
+          message
+            .key
+            .remoteJid;
+
 
         if (!chatId) {
           continue;
         }
+
+
+        const fromMe =
+          Boolean(
+            message
+              .key
+              .fromMe
+          );
+
 
         const isGroup =
           chatId.endsWith(
             "@g.us"
           );
 
+
         const participant =
-          message.key
+          message
+            .key
             .participant ||
           null;
 
+
         const participantAlt =
-          message.key
+          message
+            .key
             .participantAlt ||
           null;
 
-        /*
-         * Grupėje:
-         * sender = žmogus.
+
+        /**
+         * Kas parašė.
          *
-         * Private chat:
-         * sender = chatId.
+         * Grupėje:
+         * participant / participantAlt
+         *
+         * Private:
+         * chatId
          */
+
         const sender =
           participantAlt ||
           participant ||
           chatId;
+
+
+        const senderName =
+          message.pushName ||
+          null;
+
 
         const body =
           getTextFromMessage(
             message.message
           );
 
+
         const messageType =
           getMessageType(
             message.message
           );
+
 
         const media =
           getMediaInfo(
             message.message
           );
 
+
+        /**
+         * ČIA vienintelis realus naujas dalykas.
+         *
+         * Jei grupė:
+         * pasiimam jos subject.
+         *
+         * Jei private:
+         * naudojam pushName, kai turim.
+         */
+
+        let chatName =
+          null;
+
+
+        if (isGroup) {
+          chatName =
+            await getGroupName(
+              socket,
+              chatId
+            );
+        } else if (
+          !fromMe
+        ) {
+          chatName =
+            senderName;
+        }
+
+
         const event = {
           event:
-            "message.received",
+            fromMe
+              ? "message.sent"
+              : "message.received",
 
           session:
             id,
@@ -445,25 +668,30 @@ export async function startSession(id) {
 
           payload: {
             id:
-              message.key.id ||
+              message
+                .key
+                .id ||
               null,
+
 
             chatId,
 
+            chatName,
+
+            isGroup,
+
+
             sender,
+
+            senderName,
 
             participant,
 
             participantAlt,
 
-            fromMe:
-              false,
 
-            isGroup,
+            fromMe,
 
-            pushName:
-              message.pushName ||
-              null,
 
             body,
 
@@ -471,20 +699,31 @@ export async function startSession(id) {
               messageType,
 
             hasMedia:
-              Boolean(media),
+              Boolean(
+                media
+              ),
 
             media,
           },
         };
 
+
         console.log(
           `[${id}]`,
-          event.payload.pushName ||
-            sender,
+          fromMe
+            ? "ME"
+            : (
+                senderName ||
+                sender
+              ),
+          "→",
+          chatName ||
+            chatId,
           ":",
           body ||
             `[${messageType}]`
         );
+
 
         await sendToN8n(
           event
@@ -493,8 +732,16 @@ export async function startSession(id) {
     }
   );
 
+
   return session;
 }
+
+
+/**
+ * ---------------------------------------------------------
+ * SEND TEXT
+ * ---------------------------------------------------------
+ */
 
 export async function sendText({
   sessionId,
@@ -505,6 +752,7 @@ export async function sendText({
     sessions.get(
       sessionId
     );
+
 
   if (
     !session ||
@@ -517,11 +765,13 @@ export async function sendText({
     );
   }
 
+
   if (!chatId) {
     throw new Error(
       "chatId is required"
     );
   }
+
 
   if (!text) {
     throw new Error(
@@ -529,16 +779,27 @@ export async function sendText({
     );
   }
 
+
   const result =
-    await session.socket.sendMessage(
-      chatId,
-      {
-        text,
-      }
-    );
+    await session
+      .socket
+      .sendMessage(
+        chatId,
+        {
+          text,
+        }
+      );
+
 
   return result;
 }
+
+
+/**
+ * ---------------------------------------------------------
+ * RESTORE SESSIONS
+ * ---------------------------------------------------------
+ */
 
 export async function restoreSessions() {
   if (
@@ -549,6 +810,7 @@ export async function restoreSessions() {
     return;
   }
 
+
   const entries =
     fs.readdirSync(
       DATA_DIR,
@@ -557,6 +819,7 @@ export async function restoreSessions() {
           true,
       }
     );
+
 
   for (
     const entry
@@ -568,9 +831,11 @@ export async function restoreSessions() {
       continue;
     }
 
+
     console.log(
       `Restoring session: ${entry.name}`
     );
+
 
     try {
       await startSession(
