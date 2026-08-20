@@ -13,33 +13,130 @@ import {
   N8N_WEBHOOK_URL,
 } from "./config.js";
 
+
+/**
+ * =========================================================
+ * STORAGE
+ * =========================================================
+ */
+
 fs.mkdirSync(DATA_DIR, {
   recursive: true,
 });
 
+
+/**
+ * =========================================================
+ * SESSIONS
+ * =========================================================
+ */
+
 const sessions = new Map();
 
-function getTextFromMessage(message) {
+
+/**
+ * =========================================================
+ * GROUP METADATA CACHE
+ * =========================================================
+ *
+ * Group names don't change often.
+ * No reason to request metadata from WhatsApp
+ * for every single incoming message.
+ */
+
+const GROUP_CACHE_TTL =
+  10 * 60 * 1000;
+
+const groupCache =
+  new Map();
+
+
+function getCachedGroupMetadata(
+  jid
+) {
+  const cached =
+    groupCache.get(jid);
+
+  if (!cached) {
+    return null;
+  }
+
+  if (
+    Date.now() >
+    cached.expiresAt
+  ) {
+    groupCache.delete(jid);
+
+    return null;
+  }
+
+  return cached.metadata;
+}
+
+
+function setCachedGroupMetadata(
+  jid,
+  metadata
+) {
+  groupCache.set(
+    jid,
+    {
+      metadata,
+
+      expiresAt:
+        Date.now() +
+        GROUP_CACHE_TTL,
+    }
+  );
+}
+
+
+function clearCachedGroupMetadata(
+  jid
+) {
+  groupCache.delete(jid);
+}
+
+
+/**
+ * =========================================================
+ * MESSAGE HELPERS
+ * =========================================================
+ */
+
+function getTextFromMessage(
+  message
+) {
   return (
     message?.conversation ||
-    message?.extendedTextMessage?.text ||
-    message?.imageMessage?.caption ||
-    message?.videoMessage?.caption ||
-    message?.documentMessage?.caption ||
+    message
+      ?.extendedTextMessage
+      ?.text ||
+    message
+      ?.imageMessage
+      ?.caption ||
+    message
+      ?.videoMessage
+      ?.caption ||
+    message
+      ?.documentMessage
+      ?.caption ||
     ""
   );
 }
 
-function getMessageType(message) {
+
+function getMessageType(
+  message
+) {
   if (!message) {
     return "unknown";
   }
 
-  if (message.conversation) {
-    return "text";
-  }
-
-  if (message.extendedTextMessage) {
+  if (
+    message.conversation ||
+    message.extendedTextMessage
+  ) {
     return "text";
   }
 
@@ -71,14 +168,28 @@ function getMessageType(message) {
     return "contact";
   }
 
+  if (message.contactsArrayMessage) {
+    return "contacts";
+  }
+
   if (message.reactionMessage) {
     return "reaction";
   }
 
-  return Object.keys(message)[0] || "unknown";
+  if (message.pollCreationMessage) {
+    return "poll";
+  }
+
+  return (
+    Object.keys(message)[0] ||
+    "unknown"
+  );
 }
 
-function getMediaInfo(message) {
+
+function getMediaInfo(
+  message
+) {
   const media =
     message?.imageMessage ||
     message?.videoMessage ||
@@ -101,7 +212,8 @@ function getMediaInfo(message) {
       null,
 
     fileLength:
-      media.fileLength?.toString?.() ||
+      media.fileLength
+        ?.toString?.() ||
       media.fileLength ||
       null,
 
@@ -115,7 +227,102 @@ function getMediaInfo(message) {
   };
 }
 
-async function sendToN8n(event) {
+
+/**
+ * =========================================================
+ * GROUP NAME
+ * =========================================================
+ */
+
+async function getGroupMetadata(
+  socket,
+  chatId
+) {
+  const cached =
+    getCachedGroupMetadata(
+      chatId
+    );
+
+  if (cached) {
+    return cached;
+  }
+
+  try {
+    const metadata =
+      await socket
+        .groupMetadata(
+          chatId
+        );
+
+    setCachedGroupMetadata(
+      chatId,
+      metadata
+    );
+
+    return metadata;
+  } catch (error) {
+    console.error(
+      `[group] Cannot get metadata for ${chatId}:`,
+      error.message
+    );
+
+    return null;
+  }
+}
+
+
+async function getChatName({
+  socket,
+  chatId,
+  isGroup,
+  pushName,
+  fromMe,
+}) {
+  if (isGroup) {
+    const metadata =
+      await getGroupMetadata(
+        socket,
+        chatId
+      );
+
+    return (
+      metadata?.subject ||
+      chatId
+    );
+  }
+
+  /*
+   * Incoming private message:
+   * pushName normally represents
+   * the sender's WhatsApp profile name.
+   */
+  if (
+    !fromMe &&
+    pushName
+  ) {
+    return pushName;
+  }
+
+  /*
+   * Outgoing private messages can have
+   * unreliable pushName information.
+   *
+   * Better return null than pretend
+   * our own pushName is the recipient.
+   */
+  return null;
+}
+
+
+/**
+ * =========================================================
+ * N8N
+ * =========================================================
+ */
+
+async function sendToN8n(
+  event
+) {
   if (!N8N_WEBHOOK_URL) {
     console.warn(
       "N8N_WEBHOOK_URL is not configured"
@@ -125,26 +332,30 @@ async function sendToN8n(event) {
   }
 
   try {
-    const response = await fetch(
-      N8N_WEBHOOK_URL,
-      {
-        method: "POST",
+    const response =
+      await fetch(
+        N8N_WEBHOOK_URL,
+        {
+          method: "POST",
 
-        headers: {
-          "Content-Type":
-            "application/json",
-        },
+          headers: {
+            "Content-Type":
+              "application/json",
+          },
 
-        body: JSON.stringify(event),
-      }
-    );
+          body:
+            JSON.stringify(
+              event
+            ),
+        }
+      );
 
     if (!response.ok) {
       const responseBody =
         await response.text();
 
       console.error(
-        "n8n webhook failed:",
+        "[n8n] webhook failed:",
         response.status,
         responseBody
       );
@@ -153,42 +364,69 @@ async function sendToN8n(event) {
     }
 
     console.log(
-      `[n8n] event delivered: ${event.event}`
+      `[n8n] delivered: ${event.event}`
     );
   } catch (error) {
     console.error(
-      "n8n webhook error:",
+      "[n8n] webhook error:",
       error.message
     );
   }
 }
 
-export function getSession(id) {
+
+/**
+ * =========================================================
+ * PUBLIC SESSION HELPERS
+ * =========================================================
+ */
+
+export function getSession(
+  id
+) {
   return sessions.get(id);
 }
+
 
 export function getSessions() {
   return Array.from(
     sessions.entries()
-  ).map(([id, session]) => ({
-    id,
-    status: session.status,
-  }));
+  ).map(
+    ([id, session]) => ({
+      id,
+
+      status:
+        session.status,
+    })
+  );
 }
 
-export async function startSession(id) {
+
+/**
+ * =========================================================
+ * START WHATSAPP SESSION
+ * =========================================================
+ */
+
+export async function startSession(
+  id
+) {
   const existing =
     sessions.get(id);
 
-  if (existing?.socket) {
+  if (
+    existing?.socket
+  ) {
     return existing;
   }
+
 
   const authPath =
     path.join(
       DATA_DIR,
       id
     );
+
 
   const {
     state,
@@ -198,54 +436,138 @@ export async function startSession(id) {
       authPath
     );
 
+
   const session = {
     id,
 
-    socket: null,
+    socket:
+      null,
 
-    qr: null,
+    qr:
+      null,
 
-    status: "STARTING",
+    status:
+      "STARTING",
   };
+
 
   sessions.set(
     id,
     session
   );
 
+
+  /**
+   * Baileys can itself use our
+   * group metadata cache too.
+   */
   const socket =
     makeWASocket({
-      auth: state,
+      auth:
+        state,
 
       markOnlineOnConnect:
         false,
 
       printQRInTerminal:
         false,
+
+      cachedGroupMetadata:
+        async (
+          jid
+        ) => {
+          return (
+            getCachedGroupMetadata(
+              jid
+            ) ||
+            undefined
+          );
+        },
     });
+
 
   session.socket =
     socket;
 
+
+  /**
+   * Save updated WhatsApp keys
+   */
   socket.ev.on(
     "creds.update",
     saveCreds
   );
 
+
+  /**
+   * =======================================================
+   * GROUP UPDATES
+   * =======================================================
+   *
+   * If group name/settings/members change,
+   * invalidate cache so next message reloads it.
+   */
+
+  socket.ev.on(
+    "groups.update",
+    (updates) => {
+      for (
+        const update
+        of updates
+      ) {
+        if (
+          update.id
+        ) {
+          clearCachedGroupMetadata(
+            update.id
+          );
+        }
+      }
+    }
+  );
+
+
+  socket.ev.on(
+    "group-participants.update",
+    (update) => {
+      if (
+        update?.id
+      ) {
+        clearCachedGroupMetadata(
+          update.id
+        );
+      }
+    }
+  );
+
+
+  /**
+   * =======================================================
+   * CONNECTION EVENTS
+   * =======================================================
+   */
+
   socket.ev.on(
     "connection.update",
-    async (update) => {
+    async (
+      update
+    ) => {
       const {
         connection,
         qr,
         lastDisconnect,
       } = update;
 
+
+      /**
+       * New QR
+       */
       if (qr) {
         session.qr =
-          await QRCode.toDataURL(
-            qr
-          );
+          await QRCode
+            .toDataURL(
+              qr
+            );
 
         session.status =
           "QR";
@@ -255,10 +577,16 @@ export async function startSession(id) {
         );
       }
 
+
+      /**
+       * Connected
+       */
       if (
-        connection === "open"
+        connection ===
+        "open"
       ) {
-        session.qr = null;
+        session.qr =
+          null;
 
         session.status =
           "CONNECTED";
@@ -279,20 +607,38 @@ export async function startSession(id) {
         });
       }
 
+
+      /**
+       * Connection closed
+       */
       if (
-        connection === "close"
+        connection ===
+        "close"
       ) {
         const statusCode =
-          lastDisconnect?.error instanceof Boom
-            ? lastDisconnect.error.output.statusCode
-            : lastDisconnect?.error?.output?.statusCode;
+          lastDisconnect
+            ?.error instanceof Boom
+            ? lastDisconnect
+                .error
+                .output
+                .statusCode
+            : lastDisconnect
+                ?.error
+                ?.output
+                ?.statusCode;
+
 
         session.socket =
           null;
 
+
+        /**
+         * User intentionally logged out
+         */
         if (
           statusCode ===
-          DisconnectReason.loggedOut
+          DisconnectReason
+            .loggedOut
         ) {
           session.status =
             "LOGGED_OUT";
@@ -300,6 +646,7 @@ export async function startSession(id) {
           console.log(
             `[${id}] WhatsApp logged out`
           );
+
 
           await sendToN8n({
             event:
@@ -315,12 +662,18 @@ export async function startSession(id) {
           return;
         }
 
+
+        /**
+         * Temporary disconnect
+         */
         session.status =
           "RECONNECTING";
+
 
         console.log(
           `[${id}] reconnecting...`
         );
+
 
         await sendToN8n({
           event:
@@ -332,6 +685,7 @@ export async function startSession(id) {
           timestamp:
             Date.now(),
         });
+
 
         setTimeout(
           async () => {
@@ -356,6 +710,21 @@ export async function startSession(id) {
     }
   );
 
+
+  /**
+   * =======================================================
+   * WHATSAPP MESSAGES
+   * =======================================================
+   *
+   * ALL live messages go to n8n.
+   *
+   * Incoming:
+   * message.received
+   *
+   * Outgoing:
+   * message.sent
+   */
+
   socket.ev.on(
     "messages.upsert",
     async ({
@@ -363,79 +732,135 @@ export async function startSession(id) {
       type,
     }) => {
       if (
-        type !== "notify"
+        type !==
+        "notify"
       ) {
         return;
       }
+
 
       for (
         const message
         of messages
       ) {
-        /*
-         * Labai svarbu.
-         *
-         * Outgoing messages nekeliauja
-         * atgal į n8n, kad nekiltų loopas.
-         */
-        // if (
-        //   message.key.fromMe
-        // ) {
-        //   continue;
-        // }
-
         const chatId =
-          message.key.remoteJid;
+          message
+            .key
+            .remoteJid;
+
 
         if (!chatId) {
           continue;
         }
+
+
+        const fromMe =
+          Boolean(
+            message
+              .key
+              .fromMe
+          );
+
 
         const isGroup =
           chatId.endsWith(
             "@g.us"
           );
 
+
         const participant =
-          message.key
+          message
+            .key
             .participant ||
           null;
 
+
         const participantAlt =
-          message.key
+          message
+            .key
             .participantAlt ||
           null;
 
-        /*
-         * Grupėje:
-         * sender = žmogus.
+
+        /**
+         * Group incoming:
+         * sender is participant.
          *
-         * Private chat:
-         * sender = chatId.
+         * Private incoming:
+         * sender is chatId.
+         *
+         * Outgoing:
+         * sender is our account.
          */
         const sender =
-          participantAlt ||
-          participant ||
-          chatId;
+          fromMe
+            ? null
+            : (
+                participantAlt ||
+                participant ||
+                chatId
+              );
+
+
+        const pushName =
+          message
+            .pushName ||
+          null;
+
 
         const body =
           getTextFromMessage(
             message.message
           );
 
+
         const messageType =
           getMessageType(
             message.message
           );
+
 
         const media =
           getMediaInfo(
             message.message
           );
 
+
+        /**
+         * GROUP NAME / PRIVATE CHAT NAME
+         */
+        const chatName =
+          await getChatName({
+            socket,
+
+            chatId,
+
+            isGroup,
+
+            pushName,
+
+            fromMe,
+          });
+
+
+        /**
+         * For incoming messages,
+         * pushName = sender name.
+         */
+        const senderName =
+          fromMe
+            ? null
+            : pushName;
+
+
+        /**
+         * Complete event for n8n
+         */
         const event = {
           event:
-            "message.received",
+            fromMe
+              ? "message.sent"
+              : "message.received",
 
           session:
             id,
@@ -445,47 +870,78 @@ export async function startSession(id) {
 
           payload: {
             id:
-              message.key.id ||
+              message
+                .key
+                .id ||
               null,
 
+
+            /**
+             * CHAT
+             */
             chatId,
 
+            chatName,
+
+            isGroup,
+
+
+            /**
+             * SENDER
+             */
             sender,
+
+            senderName,
 
             participant,
 
             participantAlt,
 
-            fromMe:
-              false,
 
-            isGroup,
+            /**
+             * DIRECTION
+             */
+            fromMe,
 
-            pushName:
-              message.pushName ||
-              null,
 
+            /**
+             * MESSAGE
+             */
             body,
 
             type:
               messageType,
 
             hasMedia:
-              Boolean(media),
+              Boolean(
+                media
+              ),
 
             media,
           },
         };
 
+
         console.log(
           `[${id}]`,
-          event.payload.pushName ||
-            sender,
+          fromMe
+            ? "ME"
+            : (
+                senderName ||
+                sender
+              ),
+          "→",
+          chatName ||
+            chatId,
           ":",
           body ||
             `[${messageType}]`
         );
 
+
+        /**
+         * Everything goes to n8n.
+         */
         await sendToN8n(
           event
         );
@@ -493,8 +949,16 @@ export async function startSession(id) {
     }
   );
 
+
   return session;
 }
+
+
+/**
+ * =========================================================
+ * SEND MESSAGE
+ * =========================================================
+ */
 
 export async function sendText({
   sessionId,
@@ -505,6 +969,7 @@ export async function sendText({
     sessions.get(
       sessionId
     );
+
 
   if (
     !session ||
@@ -517,11 +982,13 @@ export async function sendText({
     );
   }
 
+
   if (!chatId) {
     throw new Error(
       "chatId is required"
     );
   }
+
 
   if (!text) {
     throw new Error(
@@ -529,16 +996,27 @@ export async function sendText({
     );
   }
 
+
   const result =
-    await session.socket.sendMessage(
-      chatId,
-      {
-        text,
-      }
-    );
+    await session
+      .socket
+      .sendMessage(
+        chatId,
+        {
+          text,
+        }
+      );
+
 
   return result;
 }
+
+
+/**
+ * =========================================================
+ * RESTORE SESSIONS AFTER RESTART
+ * =========================================================
+ */
 
 export async function restoreSessions() {
   if (
@@ -549,6 +1027,7 @@ export async function restoreSessions() {
     return;
   }
 
+
   const entries =
     fs.readdirSync(
       DATA_DIR,
@@ -557,6 +1036,7 @@ export async function restoreSessions() {
           true,
       }
     );
+
 
   for (
     const entry
@@ -568,9 +1048,11 @@ export async function restoreSessions() {
       continue;
     }
 
+
     console.log(
       `Restoring session: ${entry.name}`
     );
+
 
     try {
       await startSession(
