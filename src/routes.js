@@ -1,42 +1,762 @@
 import express from "express";
 
+import { INTERNAL_API_KEY } from "./config.js";
+import { repository } from "./repository.js";
+import { isSupabaseConfigured } from "./supabase.js";
+import { createHttpError } from "./utils.js";
 import {
+  disconnectManagedSession,
+  disconnectSession,
+  getManagedSession,
   getSession,
   getSessions,
-  startSession,
+  refreshManagedQr,
+  refreshManagedSession,
+  requestManagedPairingCode,
+  requestPairingCode,
+  retryManagedSession,
   sendText,
+  startManagedSession,
+  startSession,
+  updatePolicyCache,
 } from "./whatsapp.js";
 
 const router = express.Router();
 
-/**
- * Health
- */
+function sendError(res, error) {
+  const status = error.status || 500;
+
+  if (status >= 500) {
+    console.error(error);
+  }
+
+  return res.status(status).json({
+    error: error.message || "Unexpected error",
+    ...(error.details ? { details: error.details } : {}),
+  });
+}
+
+function requireSupabase(req, res, next) {
+  if (!isSupabaseConfigured()) {
+    return res.status(503).json({
+      error:
+        "Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on the backend.",
+    });
+  }
+
+  next();
+}
+
+function optionalInternalProtection(req, res, next) {
+  if (!INTERNAL_API_KEY) {
+    return next();
+  }
+
+  const key = req.get("x-api-key") || req.get("x-ridepicker-key");
+
+  if (key !== INTERNAL_API_KEY) {
+    return res.status(401).json({
+      error: "invalid API key",
+    });
+  }
+
+  next();
+}
+
+function requireInternalKey(req, res, next) {
+  if (!INTERNAL_API_KEY) {
+    return res.status(503).json({
+      error: "INTERNAL_API_KEY is not configured",
+    });
+  }
+
+  const key = req.get("x-api-key") || req.get("x-ridepicker-key");
+
+  if (key !== INTERNAL_API_KEY) {
+    return res.status(401).json({
+      error: "invalid API key",
+    });
+  }
+
+  next();
+}
+
+async function requireUser(req, res, next) {
+  try {
+    const user = await repository.getUserById(req.params.userId);
+
+    if (!user) {
+      return res.status(404).json({
+        error: "user not found",
+      });
+    }
+
+    req.ridePickerUser = user;
+    next();
+  } catch (error) {
+    sendError(res, error);
+  }
+}
+
+function subscriptionIsActive(row) {
+  if (!row) return false;
+  if (row.status === "active") return true;
+
+  if (
+    row.status === "cancelled" &&
+    row.current_period_end &&
+    new Date(row.current_period_end) > new Date()
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 router.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "ridepicker-whatsapp",
+    supabaseConfigured: isSupabaseConfigured(),
   });
 });
 
-/**
- * List sessions
- */
-router.get("/sessions", (req, res) => {
+// ---------------------------------------------------------------------------
+// RidePicker account / frontend API
+// ---------------------------------------------------------------------------
+
+router.get("/api/users/by-phone/:phone", requireSupabase, async (req, res) => {
+  try {
+    const user = await repository.getUserByPhone(req.params.phone);
+    res.json({ user });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+router.post("/api/users", requireSupabase, async (req, res) => {
+  try {
+    const user = await repository.createUser({
+      name: req.body?.name,
+      phone: req.body?.phone,
+      email: req.body?.email,
+    });
+
+    res.status(201).json({ user });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+router.get(
+  "/api/users/:userId",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    res.json({ user: req.ridePickerUser });
+  }
+);
+
+router.get(
+  "/api/users/:userId/profile",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const profile = await repository.getProfile(req.params.userId);
+      res.json({ profile });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.patch(
+  "/api/users/:userId/profile",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const user = await repository.updateProfile(
+        req.params.userId,
+        req.body || {}
+      );
+      res.json({ user, profile: user?.profile || null });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.get(
+  "/api/users/:userId/preferences",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const preferences = await repository.getDriverPreferences(
+        req.params.userId
+      );
+      res.json({ preferences });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.patch(
+  "/api/users/:userId/preferences",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const preferences = await repository.updateDriverPreferences(
+        req.params.userId,
+        req.body || {}
+      );
+      res.json({ preferences });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// RidePicker mode
+// ---------------------------------------------------------------------------
+
+router.get(
+  "/api/users/:userId/ridepicker",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const state = await repository.getRidePickerState(req.params.userId);
+      res.json(state);
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.put(
+  "/api/users/:userId/ridepicker",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const mode = req.body?.mode;
+
+      if (!["off", "assist", "autopilot"].includes(mode)) {
+        throw createHttpError(400, "invalid RidePicker mode");
+      }
+
+      if (mode === "autopilot") {
+        throw createHttpError(409, "Autopilot is coming soon");
+      }
+
+      const session = await repository.getWhatsappSessionByUser(
+        req.params.userId
+      );
+
+      if (mode !== "off") {
+        if (!session || session.status !== "CONNECTED") {
+          throw createHttpError(
+            409,
+            "WhatsApp must be connected before enabling RidePicker"
+          );
+        }
+
+        const subscription = await repository.getSubscriptionRow(
+          req.params.userId
+        );
+
+        if (!subscriptionIsActive(subscription)) {
+          throw createHttpError(
+            402,
+            "An active RidePicker Premium subscription is required"
+          );
+        }
+      }
+
+      if (!session && mode === "off") {
+        return res.json({
+          mode: "off",
+          botStartedAt: null,
+        });
+      }
+
+      const updated = await repository.updateWhatsappSessionByUser(
+        req.params.userId,
+        {
+          bot_mode: mode,
+        }
+      );
+
+      updatePolicyCache(updated);
+
+      await repository.addActivity(req.params.userId, {
+        type: "ridepicker",
+        title:
+          mode === "off"
+            ? "RidePicker turned off"
+            : "RidePicker set to Assist",
+        detail:
+          mode === "off"
+            ? "Monitoring stopped."
+            : "Monitoring new WhatsApp messages and detecting jobs.",
+      });
+
+      res.json({
+        mode: updated?.bot_mode || "off",
+        botStartedAt: updated?.bot_enabled_at || null,
+      });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// WhatsApp user-facing API
+// ---------------------------------------------------------------------------
+
+router.get(
+  "/api/users/:userId/whatsapp",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const session = await getManagedSession(req.params.userId);
+      res.setHeader("Cache-Control", "no-store");
+      res.json({ session });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.post(
+  "/api/users/:userId/whatsapp/start",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const method = req.body?.method || "qr";
+
+      if (!["qr", "pairing_code"].includes(method)) {
+        throw createHttpError(400, "method must be qr or pairing_code");
+      }
+
+      const session = await startManagedSession(req.params.userId, {
+        method,
+        phone: req.body?.phone || null,
+      });
+
+      res.setHeader("Cache-Control", "no-store");
+      res.json({ session });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.post(
+  "/api/users/:userId/whatsapp/pairing-code",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const session = await requestManagedPairingCode(
+        req.params.userId,
+        req.body?.phone || null
+      );
+
+      res.setHeader("Cache-Control", "no-store");
+      res.json({ session });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.post(
+  "/api/users/:userId/whatsapp/refresh-qr",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const session = await refreshManagedQr(req.params.userId);
+      res.setHeader("Cache-Control", "no-store");
+      res.json({ session });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.post(
+  "/api/users/:userId/whatsapp/reconnect",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const session = await retryManagedSession(req.params.userId);
+      res.setHeader("Cache-Control", "no-store");
+      res.json({ session });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.delete(
+  "/api/users/:userId/whatsapp",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const session = await disconnectManagedSession(req.params.userId);
+      res.json({ session });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Jobs / expenses / dashboard
+// ---------------------------------------------------------------------------
+
+router.get(
+  "/api/users/:userId/jobs",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const jobs = await repository.listJobs(req.params.userId);
+      res.json({ jobs });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.get(
+  "/api/users/:userId/jobs/:jobId",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const job = await repository.getJob(
+        req.params.userId,
+        req.params.jobId
+      );
+
+      if (!job) {
+        return res.status(404).json({ error: "job not found" });
+      }
+
+      res.json({ job });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.patch(
+  "/api/users/:userId/jobs/:jobId/status",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const job = await repository.updateJobStatus(
+        req.params.userId,
+        req.params.jobId,
+        req.body?.status
+      );
+
+      if (!job) {
+        return res.status(404).json({ error: "job not found" });
+      }
+
+      res.json({ job });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.patch(
+  "/api/users/:userId/jobs/:jobId/payment",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const job = await repository.updateJobPayment(
+        req.params.userId,
+        req.params.jobId,
+        req.body || {}
+      );
+
+      if (!job) {
+        return res.status(404).json({ error: "job not found" });
+      }
+
+      res.json({ job });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.post(
+  "/api/users/:userId/jobs/:jobId/expenses",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const job = await repository.addExpense(
+        req.params.userId,
+        req.params.jobId,
+        req.body || {}
+      );
+
+      if (!job) {
+        return res.status(404).json({ error: "job not found" });
+      }
+
+      res.status(201).json({ job });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.delete(
+  "/api/users/:userId/jobs/:jobId/expenses/:expenseId",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const job = await repository.removeExpense(
+        req.params.userId,
+        req.params.jobId,
+        req.params.expenseId
+      );
+
+      if (!job) {
+        return res.status(404).json({ error: "job not found" });
+      }
+
+      res.json({ job });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.get(
+  "/api/users/:userId/dashboard",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const summary = await repository.getDashboardSummary(req.params.userId);
+      res.json({ summary });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Activity
+// ---------------------------------------------------------------------------
+
+router.get(
+  "/api/users/:userId/activity",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const activity = await repository.listActivity(req.params.userId);
+      res.json({ activity });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.post(
+  "/api/users/:userId/activity",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const entry = await repository.addActivity(
+        req.params.userId,
+        req.body || {}
+      );
+      res.status(201).json({ entry });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Billing
+// ---------------------------------------------------------------------------
+
+router.get(
+  "/api/users/:userId/billing",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const subscription = await repository.getSubscription(req.params.userId);
+      res.json({
+        plan: repository.PLAN,
+        subscription,
+      });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.post(
+  "/api/users/:userId/billing/activate",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const now = new Date();
+      const next = new Date(now);
+      next.setMonth(next.getMonth() + 1);
+
+      await repository.updateSubscription(req.params.userId, {
+        status: "active",
+        current_period_start: now.toISOString(),
+        current_period_end: next.toISOString(),
+        next_payment_at: next.toISOString(),
+      });
+
+      const subscription = await repository.getSubscription(req.params.userId);
+      res.json({ subscription });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.post(
+  "/api/users/:userId/billing/cancel",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const current = await repository.getSubscriptionRow(req.params.userId);
+
+      if (!current) {
+        return res.status(404).json({ error: "subscription not found" });
+      }
+
+      await repository.updateSubscription(req.params.userId, {
+        status: "cancelled",
+        next_payment_at: null,
+      });
+
+      const subscription = await repository.getSubscription(req.params.userId);
+      res.json({ subscription });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.post(
+  "/api/users/:userId/billing/reactivate",
+  requireSupabase,
+  requireUser,
+  async (req, res) => {
+    try {
+      const now = new Date();
+      const next = new Date(now);
+      next.setMonth(next.getMonth() + 1);
+
+      await repository.updateSubscription(req.params.userId, {
+        status: "active",
+        current_period_start: now.toISOString(),
+        current_period_end: next.toISOString(),
+        next_payment_at: next.toISOString(),
+      });
+
+      const subscription = await repository.getSubscription(req.params.userId);
+      res.json({ subscription });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Internal n8n/API operations
+// ---------------------------------------------------------------------------
+
+router.post(
+  "/internal/jobs",
+  requireSupabase,
+  requireInternalKey,
+  async (req, res) => {
+    try {
+      const userId = req.body?.userId;
+      const inputJobs = Array.isArray(req.body?.jobs)
+        ? req.body.jobs
+        : req.body?.job
+        ? [req.body.job]
+        : [];
+
+      if (!userId || !inputJobs.length) {
+        throw createHttpError(400, "userId and jobs are required");
+      }
+
+      const created = [];
+
+      for (const job of inputJobs) {
+        created.push(
+          await repository.createJob(userId, {
+            ...job,
+            sourceMessageId:
+              job.sourceMessageId ||
+              req.body?.sourceMessageId ||
+              null,
+          })
+        );
+      }
+
+      res.status(201).json({ jobs: created });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Legacy WhatsApp API kept for the existing n8n flow / manual debugging.
+// ---------------------------------------------------------------------------
+
+router.get("/sessions", optionalInternalProtection, (req, res) => {
   res.json(getSessions());
 });
 
-/**
- * Create / start session
- */
-router.post("/sessions", async (req, res) => {
+router.post("/sessions", optionalInternalProtection, async (req, res) => {
   try {
-    const { id } = req.body;
+    const { id } = req.body || {};
 
     if (!id) {
-      return res.status(400).json({
-        error: "id required",
-      });
+      return res.status(400).json({ error: "id required" });
     }
 
     const session = await startSession(id);
@@ -46,447 +766,95 @@ router.post("/sessions", async (req, res) => {
       status: session.status,
     });
   } catch (error) {
-    console.error(error);
-
-    res.status(500).json({
-      error: error.message,
-    });
+    sendError(res, error);
   }
 });
 
-/**
- * Session status
- */
-router.get("/sessions/:id", (req, res) => {
+router.get("/sessions/:id", optionalInternalProtection, (req, res) => {
   const session = getSession(req.params.id);
 
   if (!session) {
-    return res.status(404).json({
-      error: "session not found",
-    });
+    return res.status(404).json({ error: "session not found" });
   }
 
   res.json({
     id: req.params.id,
     status: session.status,
     hasQr: Boolean(session.qr),
+    pairingCode: session.pairingCode || null,
   });
 });
 
-/**
- * Raw QR/status endpoint used by the connect page.
- *
- * The browser polls this endpoint.
- * Whenever Baileys generates a new QR,
- * session.qr automatically contains the newest one.
- */
-router.get("/sessions/:id/qr-data", (req, res) => {
+router.get("/sessions/:id/qr-data", optionalInternalProtection, (req, res) => {
   const session = getSession(req.params.id);
 
   if (!session) {
-    return res.status(404).json({
-      error: "session not found",
-    });
+    return res.status(404).json({ error: "session not found" });
   }
 
   res.setHeader("Cache-Control", "no-store");
-
   res.json({
     id: req.params.id,
     status: session.status,
     qr: session.qr || null,
+    pairingCode: session.pairingCode || null,
   });
 });
 
-/**
- * Persistent WhatsApp connect page.
- *
- * This URL itself does not expire.
- * It continuously polls /qr-data and replaces
- * expired WhatsApp QR codes automatically.
- */
+router.post(
+  "/sessions/:id/pairing-code",
+  optionalInternalProtection,
+  async (req, res) => {
+    try {
+      const result = await requestPairingCode({
+        sessionId: req.params.id,
+        phone: req.body?.phone,
+      });
+      res.json(result);
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
+router.delete(
+  "/sessions/:id",
+  optionalInternalProtection,
+  async (req, res) => {
+    try {
+      await disconnectSession(req.params.id);
+      res.json({ ok: true });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
+
 router.get("/sessions/:id/qr", (req, res) => {
   const sessionId = req.params.id;
 
   res.setHeader("Cache-Control", "no-store");
-
-  res.send(`
-<!DOCTYPE html>
+  res.send(`<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-
-  <meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
-  />
-
-  <title>Connect WhatsApp | RidePicker</title>
-
-  <style>
-    * {
-      box-sizing: border-box;
-    }
-
-    body {
-      margin: 0;
-      min-height: 100vh;
-
-      display: flex;
-      align-items: center;
-      justify-content: center;
-
-      padding: 24px;
-
-      font-family:
-        Inter,
-        Arial,
-        Helvetica,
-        sans-serif;
-
-      background: #0f1115;
-      color: #ffffff;
-    }
-
-    .card {
-      width: 100%;
-      max-width: 520px;
-
-      padding: 38px;
-
-      border: 1px solid #262b35;
-      border-radius: 24px;
-
-      background: #171a21;
-
-      text-align: center;
-    }
-
-    .logo {
-      font-size: 38px;
-      margin-bottom: 8px;
-    }
-
-    h1 {
-      margin: 0;
-
-      font-size: 28px;
-      font-weight: 700;
-    }
-
-    .subtitle {
-      margin-top: 10px;
-      margin-bottom: 28px;
-
-      color: #9ba3b2;
-      line-height: 1.5;
-    }
-
-    #qr-container {
-      min-height: 350px;
-
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-
-    #qr {
-      display: none;
-
-      width: 100%;
-      max-width: 340px;
-
-      padding: 18px;
-
-      border-radius: 18px;
-
-      background: #ffffff;
-    }
-
-    #spinner {
-      width: 42px;
-      height: 42px;
-
-      border: 4px solid #333945;
-      border-top-color: #25d366;
-
-      border-radius: 50%;
-
-      animation: spin 0.8s linear infinite;
-    }
-
-    @keyframes spin {
-      to {
-        transform: rotate(360deg);
-      }
-    }
-
-    #status {
-      margin-top: 24px;
-
-      font-size: 16px;
-      font-weight: 600;
-    }
-
-    .hint {
-      margin-top: 18px;
-
-      color: #7f8794;
-      font-size: 14px;
-      line-height: 1.6;
-    }
-
-    .success {
-      color: #25d366;
-    }
-
-    .warning {
-      color: #f6c344;
-    }
-
-    .error {
-      color: #ff6161;
-    }
-
-    .connected-icon {
-      display: none;
-
-      font-size: 72px;
-    }
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Connect WhatsApp | RidePicker</title>
+<style>
+body{font-family:Inter,system-ui,sans-serif;background:#0f1115;color:white;display:grid;place-items:center;min-height:100vh;margin:0;padding:24px}.card{width:min(520px,100%);background:#171a21;border:1px solid #262b35;border-radius:24px;padding:36px;text-align:center}.qr{width:min(340px,100%);background:white;border-radius:18px;padding:16px;display:none;margin:24px auto}.status{margin-top:18px;font-weight:600}.hint{color:#8f98a7;font-size:14px;line-height:1.6;margin-top:18px}.ok{color:#25d366}.warn{color:#f6c344}.err{color:#ff6161}
+</style>
 </head>
-
-<body>
-  <div class="card">
-    <div class="logo">🤖</div>
-
-    <h1>Connect WhatsApp</h1>
-
-    <div class="subtitle">
-      Connect your WhatsApp account to RidePicker.
-    </div>
-
-    <div id="qr-container">
-      <div id="spinner"></div>
-
-      <img
-        id="qr"
-        alt="WhatsApp QR code"
-      />
-
-      <div
-        id="connected-icon"
-        class="connected-icon"
-      >
-        ✅
-      </div>
-    </div>
-
-    <div id="status">
-      Generating QR...
-    </div>
-
-    <div class="hint">
-      WhatsApp
-      →
-      Linked devices
-      →
-      Link a device
-      <br />
-      <br />
-      Keep this page open.
-      Expired QR codes refresh automatically.
-    </div>
-  </div>
-
-  <script>
-    const sessionId =
-      ${JSON.stringify(sessionId)};
-
-    const qr =
-      document.getElementById("qr");
-
-    const spinner =
-      document.getElementById("spinner");
-
-    const status =
-      document.getElementById("status");
-
-    const connectedIcon =
-      document.getElementById(
-        "connected-icon"
-      );
-
-    let lastQr = null;
-    let stopped = false;
-
-    function showLoading(message) {
-      spinner.style.display = "block";
-      qr.style.display = "none";
-
-      connectedIcon.style.display =
-        "none";
-
-      status.className = "";
-      status.textContent = message;
-    }
-
-    function showQr(qrData) {
-      spinner.style.display = "none";
-
-      connectedIcon.style.display =
-        "none";
-
-      qr.style.display = "block";
-
-      if (lastQr !== qrData) {
-        qr.src = qrData;
-        lastQr = qrData;
-      }
-
-      status.className = "";
-      status.textContent =
-        "Scan this QR with WhatsApp";
-    }
-
-    function showConnected() {
-      stopped = true;
-
-      spinner.style.display = "none";
-      qr.style.display = "none";
-
-      connectedIcon.style.display =
-        "block";
-
-      status.className = "success";
-
-      status.textContent =
-        "WhatsApp connected";
-    }
-
-    function showError(message) {
-      spinner.style.display = "none";
-      qr.style.display = "none";
-
-      connectedIcon.style.display =
-        "none";
-
-      status.className = "error";
-      status.textContent = message;
-    }
-
-    async function refreshQr() {
-      if (stopped) {
-        return;
-      }
-
-      try {
-        const response = await fetch(
-          "/sessions/" +
-            encodeURIComponent(sessionId) +
-            "/qr-data",
-          {
-            cache: "no-store",
-          }
-        );
-
-        if (!response.ok) {
-          if (response.status === 404) {
-            showLoading(
-              "Starting WhatsApp session..."
-            );
-
-            await fetch("/sessions", {
-              method: "POST",
-
-              headers: {
-                "Content-Type":
-                  "application/json",
-              },
-
-              body: JSON.stringify({
-                id: sessionId,
-              }),
-            });
-
-            return;
-          }
-
-          throw new Error(
-            "HTTP " + response.status
-          );
-        }
-
-        const data =
-          await response.json();
-
-        if (
-          data.status === "CONNECTED"
-        ) {
-          showConnected();
-          return;
-        }
-
-        if (data.qr) {
-          showQr(data.qr);
-          return;
-        }
-
-        if (
-          data.status === "RECONNECTING"
-        ) {
-          showLoading(
-            "Refreshing connection..."
-          );
-
-          return;
-        }
-
-        if (
-          data.status === "LOGGED_OUT"
-        ) {
-          showError(
-            "Session logged out. Start a new session."
-          );
-
-          return;
-        }
-
-        showLoading(
-          "Generating fresh QR..."
-        );
-      } catch (error) {
-        console.error(error);
-
-        status.className = "warning";
-
-        status.textContent =
-          "Connection interrupted. Retrying...";
-      }
-    }
-
-    refreshQr();
-
-    setInterval(
-      refreshQr,
-      1500
-    );
-  </script>
-</body>
-</html>
-  `);
+<body><div class="card"><h1>Connect WhatsApp</h1><p>Scan the latest QR code with WhatsApp.</p><img id="qr" class="qr" /><div id="status" class="status">Preparing connection…</div><div class="hint">WhatsApp → Linked devices → Link a device<br/>Expired codes refresh automatically.</div></div>
+<script>
+const id=${JSON.stringify(sessionId)};const qr=document.getElementById('qr');const status=document.getElementById('status');
+async function tick(){try{let r=await fetch('/sessions/'+encodeURIComponent(id)+'/qr-data',{cache:'no-store'});if(r.status===404){await fetch('/sessions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id})});status.textContent='Starting session…';return}let d=await r.json();if(d.status==='CONNECTED'){qr.style.display='none';status.className='status ok';status.textContent='WhatsApp connected';return}if(d.status==='LOGGED_OUT'){qr.style.display='none';status.className='status err';status.textContent='Session logged out';return}if(d.qr){qr.src=d.qr;qr.style.display='block';status.className='status';status.textContent='Waiting for scan';return}status.className='status warn';status.textContent=d.status==='RECONNECTING'?'Reconnecting…':'Preparing fresh QR…'}catch(e){status.className='status warn';status.textContent='Connection interrupted. Retrying…'}}
+tick();setInterval(tick,1500);
+</script></body></html>`);
 });
 
-/**
- * Send WhatsApp message
- */
-router.post("/send", async (req, res) => {
+router.post("/send", optionalInternalProtection, async (req, res) => {
   try {
-    const {
-      session,
-      chatId,
-      text,
-    } = req.body;
+    const { session, chatId, text } = req.body || {};
 
     const result = await sendText({
       sessionId: session,
@@ -496,17 +864,11 @@ router.post("/send", async (req, res) => {
 
     res.json({
       ok: true,
-
-      id:
-        result?.key?.id ||
-        null,
+      id: result?.key?.id || null,
     });
   } catch (error) {
-    console.error(error);
-
-    res.status(400).json({
-      error: error.message,
-    });
+    error.status = error.status || 400;
+    sendError(res, error);
   }
 });
 

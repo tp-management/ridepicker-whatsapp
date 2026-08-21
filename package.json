@@ -1,13 +1,14 @@
 {
-  "name": "ridepicker-whatsapp",
-  "version": "1.0.0",
-  "description": "RidePicker WhatsApp service",
+  "name": "ridepicker-backend",
+  "version": "1.1.0",
+  "description": "RidePicker API + WhatsApp/Baileys service",
   "main": "index.js",
   "type": "module",
   "private": true,
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "check": "node --check index.js && node --check src/app.js && node --check src/config.js && node --check src/routes.js && node --check src/whatsapp.js && node --check src/repository.js && node --check src/supabase.js && node --check src/utils.js"
   },
   "engines": {
     "node": ">=20"
