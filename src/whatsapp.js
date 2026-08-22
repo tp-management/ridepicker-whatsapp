@@ -31,13 +31,39 @@ fs.mkdirSync(DATA_DIR, {
 });
 
 const sessions = new Map();
+const managedPairingFlows = new Map();
 const groupNameCache = new Map();
 const policyCache = new Map();
 const chatWriteCache = new Map();
 
 const GROUP_CACHE_TTL = 10 * 60 * 1000;
 const CHAT_WRITE_TTL = 10 * 60 * 1000;
-const PAIRING_CODE_DISPLAY_TTL = 5 * 60 * 1000;
+
+// WhatsApp Web's phone-number pairing UI refreshes its code roughly every
+// three minutes. Baileys does not rotate pairing codes for us, so RidePicker
+// owns that lifecycle for managed sessions.
+const MANAGED_PAIRING_ROTATE_MS = 3 * 60 * 1000;
+
+// Baileys can resolve requestPairingCode() before WhatsApp has finished
+// validating the underlying companion_hello request. A short grace window
+// prevents us from publishing codes that are rejected immediately afterwards.
+const MANAGED_PAIRING_PUBLISH_GRACE_MS = 3 * 1000;
+
+// Automatic recovery is deliberately bounded. Repeatedly hammering WhatsApp
+// after 400/401/428/515 failures can make rate limiting or account-risk checks
+// worse, so after three automatic retries we stop and require a new user tap.
+const MANAGED_PAIRING_RETRY_DELAYS_MS = [3_000, 10_000, 30_000];
+const MANAGED_PAIRING_MAX_AUTOMATIC_RETRIES =
+  MANAGED_PAIRING_RETRY_DELAYS_MS.length;
+
+// A 408 after a code has been alive for most of its normal three-minute cycle
+// is treated as ordinary expiry rather than a protocol failure.
+const MANAGED_PAIRING_NATURAL_EXPIRY_MIN_AGE_MS = 2 * 60 * 1000;
+
+// Legacy/internal pairing-code endpoint compatibility only. Managed user
+// pairing below does NOT use this value as proof that a code is still valid.
+const LEGACY_PAIRING_CODE_DISPLAY_TTL = 3 * 60 * 1000;
+
 const PAIRING_READY_TIMEOUT_MS = 15 * 1000;
 const REGISTRATION_CONFIRM_TIMEOUT_MS = 5 * 1000;
 
@@ -190,7 +216,7 @@ async function waitForRegisteredSession(session, socket) {
   return Boolean(session?.registered && socket?.user?.id);
 }
 
-function pairingCodeIsFresh(session) {
+function legacyPairingCodeIsFresh(session) {
   if (!session?.pairingCode || !session?.pairingCodeIssuedAt) {
     return false;
   }
@@ -198,26 +224,526 @@ function pairingCodeIsFresh(session) {
   const issuedAt = new Date(session.pairingCodeIssuedAt).getTime();
   return (
     Number.isFinite(issuedAt) &&
-    Date.now() - issuedAt < PAIRING_CODE_DISPLAY_TTL
+    Date.now() - issuedAt < LEGACY_PAIRING_CODE_DISPLAY_TTL
   );
 }
 
-function resetFailedPairingSession(sessionId) {
-  const existing = sessions.get(sessionId);
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  if (existing) {
-    clearReconnectTimer(existing);
+function isCurrentSession(session) {
+  return Boolean(
+    session &&
+      !session.disposed &&
+      sessions.get(session.id) === session
+  );
+}
 
-    try {
-      existing.socket?.end?.(new Error("Resetting failed pairing session"));
-    } catch {
-      // Socket may already be closed.
-    }
+function clearManagedPairingTimers(flow) {
+  if (!flow) return;
 
-    sessions.delete(sessionId);
+  if (flow.rotateTimer) {
+    clearTimeout(flow.rotateTimer);
+    flow.rotateTimer = null;
   }
 
-  removeAuthDirectory(sessionId);
+  if (flow.retryTimer) {
+    clearTimeout(flow.retryTimer);
+    flow.retryTimer = null;
+  }
+}
+
+function invalidateManagedPairingCode(flow) {
+  if (!flow) return;
+
+  flow.code = null;
+  flow.codeIssuedAt = null;
+  flow.codeRotatesAt = null;
+  flow.published = false;
+}
+
+function managedPairingCodeIsVisible(flow) {
+  return Boolean(
+    flow?.active &&
+      flow?.published &&
+      flow?.code &&
+      flow?.codeIssuedAt
+  );
+}
+
+function stopManagedPairingFlow(
+  sessionId,
+  { keepForError = false } = {}
+) {
+  const flow = managedPairingFlows.get(sessionId);
+  if (!flow) return;
+
+  clearManagedPairingTimers(flow);
+  flow.active = false;
+  flow.requestInFlight = false;
+  flow.attemptToken += 1;
+  invalidateManagedPairingCode(flow);
+
+  if (!keepForError) {
+    managedPairingFlows.delete(sessionId);
+  }
+}
+
+function ensureManagedPairingFlow({ sessionId, userId, phone }) {
+  const digits = phoneDigits(phone);
+
+  if (!digits) {
+    const error = new Error(
+      'A valid WhatsApp phone number with country code is required.'
+    );
+    error.status = 400;
+    throw error;
+  }
+
+  let flow = managedPairingFlows.get(sessionId);
+
+  if (!flow) {
+    flow = {
+      sessionId,
+      userId,
+      phoneDigits: digits,
+      phone: `+${digits}`,
+      active: true,
+      requestInFlight: false,
+      attemptToken: 0,
+      generation: 0,
+      failureCount: 0,
+      retryTimer: null,
+      rotateTimer: null,
+      code: null,
+      codeIssuedAt: null,
+      codeRotatesAt: null,
+      published: false,
+      lastError: null,
+      lastFailureAt: null,
+    };
+
+    managedPairingFlows.set(sessionId, flow);
+    return flow;
+  }
+
+  const phoneChanged = flow.phoneDigits !== digits;
+  const restartingAfterTerminalError = !flow.active;
+
+  if (phoneChanged || restartingAfterTerminalError) {
+    clearManagedPairingTimers(flow);
+    invalidateManagedPairingCode(flow);
+    flow.requestInFlight = false;
+    flow.attemptToken += 1;
+    flow.failureCount = 0;
+    flow.lastError = null;
+    flow.lastFailureAt = null;
+  }
+
+  flow.userId = userId;
+  flow.phoneDigits = digits;
+  flow.phone = `+${digits}`;
+  flow.active = true;
+
+  return flow;
+}
+
+function dropSocketSession(
+  session,
+  { removeAuth = false, reason = 'Replacing WhatsApp socket' } = {}
+) {
+  if (!session) return;
+
+  clearReconnectTimer(session);
+  session.disposed = true;
+
+  // Release any waiter that is blocked waiting for QR readiness. The waiter
+  // re-checks isCurrentSession() immediately afterwards and exits safely.
+  resolvePairingReady(session);
+
+  const socket = session.socket;
+  session.socket = null;
+
+  if (sessions.get(session.id) === session) {
+    sessions.delete(session.id);
+  }
+
+  if (socket) {
+    try {
+      socket.end?.(new Error(reason));
+    } catch {
+      // The transport may already be closed.
+    }
+  }
+
+  if (removeAuth) {
+    removeAuthDirectory(session.id);
+  }
+}
+
+function managedPairingRetryDelay(failureCount) {
+  const index = Math.max(
+    0,
+    Math.min(
+      failureCount - 1,
+      MANAGED_PAIRING_RETRY_DELAYS_MS.length - 1
+    )
+  );
+
+  return MANAGED_PAIRING_RETRY_DELAYS_MS[index];
+}
+
+function scheduleManagedPairingRotation(flow) {
+  if (!flow?.active || !flow.codeRotatesAt) return;
+
+  if (flow.rotateTimer) {
+    clearTimeout(flow.rotateTimer);
+  }
+
+  const delay = Math.max(
+    1_000,
+    new Date(flow.codeRotatesAt).getTime() - Date.now()
+  );
+
+  flow.rotateTimer = setTimeout(() => {
+    flow.rotateTimer = null;
+
+    if (!flow.active) return;
+
+    // Surviving a full code cycle is a strong enough signal to reset the
+    // abnormal-failure circuit breaker.
+    flow.failureCount = 0;
+    invalidateManagedPairingCode(flow);
+
+    const session = sessions.get(flow.sessionId);
+    if (isCurrentSession(session)) {
+      session.status = 'STARTING';
+      session.lastError = null;
+      session.pairingCode = null;
+      session.pairingCodeIssuedAt = null;
+      session.pairingAttemptActive = true;
+
+      void persistSessionState(session, {
+        status: 'STARTING',
+      });
+    }
+
+    void writeSystemLog({
+      userId: flow.userId,
+      sessionId: flow.sessionId,
+      level: 'info',
+      source: 'whatsapp',
+      event: 'pairing_code_refresh_started',
+      message: 'Refreshing WhatsApp pairing code automatically',
+      details: {
+        reason: 'scheduled_3_minute_refresh',
+      },
+    });
+
+    void ensureManagedPairingAttempt(flow, {
+      reason: 'scheduled_refresh',
+      forceNewCode: true,
+    });
+  }, delay);
+}
+
+async function handleManagedPairingFailure(
+  flow,
+  session,
+  {
+    statusCode = null,
+    message = 'WhatsApp pairing failed',
+    phase = 'connection',
+  } = {}
+) {
+  if (!flow?.active) return;
+
+  const codeAgeMs = flow.codeIssuedAt
+    ? Date.now() - new Date(flow.codeIssuedAt).getTime()
+    : 0;
+
+  const naturalExpiry =
+    statusCode === DisconnectReason.timedOut &&
+    codeAgeMs >= MANAGED_PAIRING_NATURAL_EXPIRY_MIN_AGE_MS;
+
+  clearManagedPairingTimers(flow);
+  flow.requestInFlight = false;
+  flow.attemptToken += 1;
+  flow.lastError = {
+    code: statusCode,
+    message,
+  };
+  flow.lastFailureAt = new Date().toISOString();
+  invalidateManagedPairingCode(flow);
+
+  if (naturalExpiry) {
+    flow.failureCount = 0;
+  } else {
+    flow.failureCount += 1;
+  }
+
+  const canAutoRetry =
+    naturalExpiry ||
+    flow.failureCount <= MANAGED_PAIRING_MAX_AUTOMATIC_RETRIES;
+
+  if (session) {
+    session.pairingAttemptActive = false;
+    session.pairingRequestInFlight = false;
+    session.pairingCode = null;
+    session.pairingCodeIssuedAt = null;
+    session.pairingPhone = flow.phone;
+    session.lastError = flow.lastError;
+    session.status = canAutoRetry ? 'STARTING' : 'ERROR';
+
+    await persistSessionState(session, {
+      status: session.status,
+    });
+
+    logWhatsappEvent(
+      session,
+      canAutoRetry ? 'warning' : 'error',
+      'pairing_failed',
+      message,
+      {
+        statusCode,
+        phase,
+        naturalExpiry,
+        failureCount: flow.failureCount,
+        automaticRetry: canAutoRetry,
+      }
+    );
+
+    dropSocketSession(session, {
+      removeAuth: true,
+      reason: 'Resetting failed WhatsApp pairing transport',
+    });
+  } else {
+    void writeSystemLog({
+      userId: flow.userId,
+      sessionId: flow.sessionId,
+      level: canAutoRetry ? 'warning' : 'error',
+      source: 'whatsapp',
+      event: 'pairing_failed',
+      message,
+      details: {
+        statusCode,
+        phase,
+        naturalExpiry,
+        failureCount: flow.failureCount,
+        automaticRetry: canAutoRetry,
+      },
+    });
+  }
+
+  if (!canAutoRetry) {
+    flow.active = false;
+
+    void writeSystemLog({
+      userId: flow.userId,
+      sessionId: flow.sessionId,
+      level: 'error',
+      source: 'whatsapp',
+      event: 'pairing_auto_retry_exhausted',
+      message:
+        'Automatic WhatsApp pairing retries stopped to avoid rate limiting',
+      details: {
+        failureCount: flow.failureCount,
+        lastStatusCode: statusCode,
+      },
+    });
+
+    return;
+  }
+
+  const delay = naturalExpiry
+    ? 1_000
+    : managedPairingRetryDelay(flow.failureCount);
+
+  void writeSystemLog({
+    userId: flow.userId,
+    sessionId: flow.sessionId,
+    level: 'info',
+    source: 'whatsapp',
+    event: 'pairing_auto_retry_scheduled',
+    message: 'A new WhatsApp pairing code will be generated automatically',
+    details: {
+      delayMs: delay,
+      failureCount: flow.failureCount,
+      naturalExpiry,
+    },
+  });
+
+  flow.retryTimer = setTimeout(() => {
+    flow.retryTimer = null;
+
+    if (!flow.active) return;
+
+    void ensureManagedPairingAttempt(flow, {
+      reason: naturalExpiry ? 'expired_code_retry' : 'auto_retry',
+      forceNewCode: true,
+    });
+  }, delay);
+}
+
+async function ensureManagedPairingAttempt(
+  flow,
+  { reason = 'initial', forceNewCode = false } = {}
+) {
+  if (!flow?.active || flow.requestInFlight || flow.retryTimer) {
+    return null;
+  }
+
+  if (managedPairingCodeIsVisible(flow) && !forceNewCode) {
+    return {
+      code: flow.code,
+      issuedAt: flow.codeIssuedAt,
+      phone: flow.phone,
+      displayExpiresAt: flow.codeRotatesAt,
+    };
+  }
+
+  let session = sessions.get(flow.sessionId);
+
+  if (!isCurrentSession(session) || !session.socket) {
+    session = await startSession(flow.sessionId, {
+      userId: flow.userId,
+    });
+  }
+
+  if (session.registered) {
+    stopManagedPairingFlow(flow.sessionId);
+    return null;
+  }
+
+  flow.requestInFlight = true;
+  const attemptToken = ++flow.attemptToken;
+  const socket = session.socket;
+
+  try {
+    await waitForPairingReady(session);
+
+    if (
+      !flow.active ||
+      attemptToken !== flow.attemptToken ||
+      !isCurrentSession(session) ||
+      session.socket !== socket
+    ) {
+      return null;
+    }
+
+    if (session.registered) {
+      stopManagedPairingFlow(flow.sessionId);
+      return null;
+    }
+
+    clearManagedPairingTimers(flow);
+    invalidateManagedPairingCode(flow);
+    flow.lastError = null;
+
+    session.status = 'STARTING';
+    session.lastError = null;
+    session.pairingAttemptActive = true;
+    session.pairingRequestInFlight = true;
+    session.pairingCode = null;
+    session.pairingCodeIssuedAt = null;
+    session.pairingPhone = flow.phone;
+
+    await persistSessionState(session, {
+      status: 'STARTING',
+    });
+
+    logWhatsappEvent(
+      session,
+      'info',
+      'pairing_started',
+      'WhatsApp pairing code requested',
+      {
+        reason,
+        nextGeneration: flow.generation + 1,
+      }
+    );
+
+    const candidateCode = await socket.requestPairingCode(
+      flow.phoneDigits
+    );
+
+    // Do NOT publish the candidate immediately. Baileys currently returns the
+    // code before WhatsApp has necessarily accepted companion_hello.
+    await sleep(MANAGED_PAIRING_PUBLISH_GRACE_MS);
+
+    if (
+      !flow.active ||
+      attemptToken !== flow.attemptToken ||
+      !isCurrentSession(session) ||
+      session.socket !== socket ||
+      session.lastError ||
+      session.registered
+    ) {
+      return null;
+    }
+
+    const issuedAt = new Date();
+    flow.generation += 1;
+    flow.code = candidateCode;
+    flow.codeIssuedAt = issuedAt.toISOString();
+    flow.codeRotatesAt = new Date(
+      issuedAt.getTime() + MANAGED_PAIRING_ROTATE_MS
+    ).toISOString();
+    flow.published = true;
+    flow.lastError = null;
+
+    session.pairingCode = candidateCode;
+    session.pairingCodeIssuedAt = flow.codeIssuedAt;
+    session.pairingPhone = flow.phone;
+    session.pairingAttemptActive = true;
+    session.status = 'STARTING';
+    session.lastError = null;
+
+    logWhatsappEvent(
+      session,
+      'info',
+      'pairing_code_created',
+      'WhatsApp pairing code created',
+      {
+        generation: flow.generation,
+        autoRefreshInMs: MANAGED_PAIRING_ROTATE_MS,
+      }
+    );
+
+    await persistSessionState(session, {
+      status: 'STARTING',
+    });
+
+    scheduleManagedPairingRotation(flow);
+
+    return {
+      code: flow.code,
+      issuedAt: flow.codeIssuedAt,
+      phone: flow.phone,
+      displayExpiresAt: flow.codeRotatesAt,
+    };
+  } catch (error) {
+    if (flow.active && attemptToken === flow.attemptToken) {
+      const { statusCode, message } = disconnectDetails({ error });
+
+      await handleManagedPairingFailure(flow, session, {
+        statusCode,
+        message: message || error.message,
+        phase: 'request',
+      });
+    }
+
+    return null;
+  } finally {
+    if (attemptToken === flow.attemptToken) {
+      flow.requestInFlight = false;
+    }
+
+    if (isCurrentSession(session)) {
+      session.pairingRequestInFlight = false;
+    }
+  }
 }
 
 function disconnectDetails(lastDisconnect) {
@@ -672,7 +1198,8 @@ export function getSessions() {
     id,
     userId: session.userId || null,
     status: session.status,
-    pairingCode: session.pairingCode || null,
+    pairingCode:
+      managedPairingFlows.get(id)?.code || session.pairingCode || null,
   }));
 }
 
@@ -709,6 +1236,7 @@ export async function startSession(
     registered: Boolean(state?.creds?.registered),
     reconnectTimer: null,
     lastError: null,
+    disposed: false,
   };
 
   sessions.set(id, session);
@@ -724,6 +1252,8 @@ export async function startSession(
   session.socket = socket;
 
   socket.ev.on("creds.update", async () => {
+    if (!isCurrentSession(session)) return;
+
     await saveCreds();
 
     const wasRegistered = session.registered;
@@ -741,7 +1271,10 @@ export async function startSession(
   });
 
   socket.ev.on("connection.update", async (update) => {
+    if (!isCurrentSession(session)) return;
+
     const { connection, qr, lastDisconnect } = update;
+    const managedPairingFlow = managedPairingFlows.get(id) || null;
 
     // Pairing-code auth must wait for the first QR challenge. This mirrors
     // the official Baileys example and avoids asking for a phone code while
@@ -753,7 +1286,8 @@ export async function startSession(
     if (qr) {
       session.qr = await QRCode.toDataURL(qr);
       session.qrIssuedAt = new Date().toISOString();
-      session.status = "QR";
+
+      if (!isCurrentSession(session)) return;
 
       console.log(`[${id}] QR ready`);
       logWhatsappEvent(
@@ -763,9 +1297,23 @@ export async function startSession(
         "WhatsApp QR fallback is ready"
       );
 
-      await persistSessionState(session, {
-        status: "QR",
-      });
+      if (managedPairingFlow?.active) {
+        session.status = "STARTING";
+
+        await persistSessionState(session, {
+          status: "STARTING",
+        });
+
+        void ensureManagedPairingAttempt(managedPairingFlow, {
+          reason: "qr_ready",
+        });
+      } else {
+        session.status = "QR";
+
+        await persistSessionState(session, {
+          status: "QR",
+        });
+      }
     }
 
     if (connection === "open") {
@@ -802,6 +1350,8 @@ export async function startSession(
 
         return;
       }
+
+      stopManagedPairingFlow(id);
 
       session.qr = null;
       session.qrIssuedAt = null;
@@ -876,13 +1426,44 @@ export async function startSession(
         message,
       };
 
+      // creds.update is asynchronous. Read the live auth state again before
+      // deciding whether a 515 is a successful post-pairing restart.
+      session.registered = Boolean(
+        session.registered || state?.creds?.registered
+      );
+
       const restartRequired =
         statusCode === DisconnectReason.restartRequired;
+      const managedFlow = managedPairingFlows.get(id) || null;
 
-      // A 515/restartRequired is part of the normal Baileys pairing flow after
-      // credentials have been accepted. Recreate the socket with the saved
-      // credentials instead of treating it as a failed pairing.
-      if (restartRequired) {
+      // creds.update and connection.update are separate async event streams.
+      // Give a 515 a very short grace period so a legitimate pair-success can
+      // finish marking credentials as registered before we classify it as a
+      // failed pairing attempt.
+      if (restartRequired && managedFlow?.active && !session.registered) {
+        await sleep(500);
+        session.registered = Boolean(
+          session.registered || state?.creds?.registered
+        );
+      }
+
+      // For a managed phone-code pairing attempt, any transport close before
+      // credentials are actually registered invalidates the current code.
+      // We never keep showing a dead code. The backend automatically creates a
+      // clean socket and a new code using bounded backoff.
+      if (managedFlow?.active && !session.registered) {
+        await handleManagedPairingFailure(managedFlow, session, {
+          statusCode,
+          message,
+          phase: "connection",
+        });
+        return;
+      }
+
+      // 515/restartRequired is normal only AFTER the credentials have really
+      // registered. Preserve auth and reconnect instead of wiping it.
+      if (restartRequired && session.registered) {
+        stopManagedPairingFlow(id);
         session.status = "RECONNECTING";
 
         console.log(
@@ -903,23 +1484,32 @@ export async function startSession(
         if (!session.reconnectTimer) {
           session.reconnectTimer = setTimeout(async () => {
             session.reconnectTimer = null;
-            sessions.delete(id);
+
+            if (!isCurrentSession(session)) return;
+
+            const userId = session.userId;
+            dropSocketSession(session, {
+              removeAuth: false,
+              reason: "Restarting registered WhatsApp session",
+            });
 
             try {
               await startSession(id, {
-                userId: session.userId,
+                userId,
               });
             } catch (error) {
               console.error(`[${id}] restart failed:`, error);
-              logWhatsappEvent(
-                session,
-                "error",
-                "restart_failed",
-                error.message,
-                { error }
-              );
+              void writeSystemLog({
+                userId,
+                sessionId: id,
+                level: "error",
+                source: "whatsapp",
+                event: "restart_failed",
+                message: error.message,
+                details: { error },
+              });
 
-              await persistSessionState(session, {
+              await repository.updateWhatsappSessionById(id, {
                 status: "ERROR",
               });
             }
@@ -929,19 +1519,19 @@ export async function startSession(
         return;
       }
 
-      // During an unregistered pairing attempt, a close is a pairing failure,
-      // not a real user logout. Keep the last code in memory for the display
-      // TTL so polling cannot make it vanish while the user is typing. Do not
-      // destroy partial auth asynchronously here. The NEXT explicit request
-      // for a new code resets failed auth before creating a fresh socket.
+      // Legacy/internal pairing endpoint compatibility. Managed user pairing
+      // is handled above by managedPairingFlows.
       if (!session.registered && session.pairingAttemptActive) {
         clearReconnectTimer(session);
         session.status = "ERROR";
         session.pairingAttemptActive = false;
         session.pairingRequestInFlight = false;
+        session.pairingCode = null;
+        session.pairingCodeIssuedAt = null;
+        session.pairingPhone = null;
 
         console.error(
-          `[${id}] pairing failed before credentials were registered`,
+          `[${id}] legacy pairing failed before credentials were registered`,
           JSON.stringify({ statusCode, message })
         );
         logWhatsappEvent(
@@ -952,8 +1542,7 @@ export async function startSession(
           {
             statusCode,
             registered: session.registered,
-            authReset: false,
-            codePreservedForDisplay: Boolean(session.pairingCode),
+            managed: false,
           }
         );
 
@@ -966,6 +1555,7 @@ export async function startSession(
 
       // Only a non-pairing 401 is a genuine WhatsApp logout.
       if (statusCode === DisconnectReason.loggedOut) {
+        stopManagedPairingFlow(id);
         clearReconnectTimer(session);
         session.status = "LOGGED_OUT";
         session.qr = null;
@@ -1029,11 +1619,18 @@ export async function startSession(
       if (!session.reconnectTimer) {
         session.reconnectTimer = setTimeout(async () => {
           session.reconnectTimer = null;
-          sessions.delete(id);
+
+          if (!isCurrentSession(session)) return;
+
+          const userId = session.userId;
+          dropSocketSession(session, {
+            removeAuth: false,
+            reason: "Reconnecting WhatsApp session",
+          });
 
           try {
             await startSession(id, {
-              userId: session.userId,
+              userId,
             });
           } catch (error) {
             console.error(`[${id}] reconnect failed:`, error);
@@ -1055,6 +1652,8 @@ export async function startSession(
   });
 
   socket.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (!isCurrentSession(session)) return;
+
     if (type !== "notify") {
       return;
     }
@@ -1219,6 +1818,10 @@ export async function startManagedSession(
     throw error;
   }
 
+  if (method === "pairing_code") {
+    return requestManagedPairingCode(userId, phone);
+  }
+
   const user = await repository.getUserRowById(userId);
 
   if (!user) {
@@ -1227,44 +1830,18 @@ export async function startManagedSession(
     throw error;
   }
 
-  let dbSession = await repository.ensureWhatsappSession(userId);
+  const dbSession = await repository.ensureWhatsappSession(userId);
 
   if (!dbSession) {
     throw new Error("Could not create WhatsApp session");
-  }
-
-  if (
-    dbSession.status === "LOGGED_OUT" ||
-    dbSession.status === "DISCONNECTED" ||
-    dbSession.status === "ERROR"
-  ) {
-    const memorySession = sessions.get(dbSession.id);
-
-    if (!memorySession?.socket && dbSession.status === "LOGGED_OUT") {
-      removeAuthDirectory(dbSession.id);
-    }
-  }
-
-  if (method === "pairing_code" && dbSession.status === "ERROR") {
-    resetFailedPairingSession(dbSession.id);
   }
 
   const session = await startSession(dbSession.id, {
     userId,
   });
 
-  if (method === "pairing_code") {
-    const pairingPhone = phone || user.phone_e164;
-
-    await requestPairingCode({
-      sessionId: dbSession.id,
-      userId,
-      phone: pairingPhone,
-    });
-  }
-
-  dbSession = await repository.getWhatsappSessionByUser(userId);
-  return normalizeManagedSession(dbSession, session);
+  const latest = await repository.getWhatsappSessionByUser(userId);
+  return normalizeManagedSession(latest, session);
 }
 
 export async function getManagedSession(userId) {
@@ -1290,6 +1867,12 @@ export async function refreshManagedSession(userId) {
 }
 
 export async function requestManagedPairingCode(userId, phone = null) {
+  if (!isSupabaseConfigured()) {
+    const error = new Error("Supabase is not configured");
+    error.status = 503;
+    throw error;
+  }
+
   const dbSession = await repository.ensureWhatsappSession(userId);
   const user = await repository.getUserRowById(userId);
 
@@ -1299,59 +1882,87 @@ export async function requestManagedPairingCode(userId, phone = null) {
     throw error;
   }
 
-  let memorySession = sessions.get(dbSession.id) || null;
+  let session = sessions.get(dbSession.id) || null;
 
-  // Repeated taps while the current attempt is healthy return the SAME fresh
-  // code. We never rotate a live code under the user's fingers.
-  if (
-    memorySession?.socket &&
-    memorySession.pairingAttemptActive &&
-    !memorySession.lastError &&
-    pairingCodeIsFresh(memorySession)
-  ) {
-    const latest = await repository.getWhatsappSessionByUser(userId);
+  if (session?.registered || dbSession.status === "CONNECTED") {
+    if (!session?.registered && dbSession.status === "CONNECTED") {
+      session = await startSession(dbSession.id, {
+        userId,
+      });
+    }
 
-    return {
-      ...normalizeManagedSession(latest, memorySession),
-      pairingCode: {
-        code: memorySession.pairingCode,
-        issuedAt: memorySession.pairingCodeIssuedAt,
-        phone: memorySession.pairingPhone,
-      },
-    };
+    if (session?.registered) {
+      const error = new Error(
+        "WhatsApp is already connected. Disconnect it before requesting a new pairing code."
+      );
+      error.status = 409;
+      throw error;
+    }
   }
 
-  // If the previous attempt failed, clean its temporary auth only when the
-  // user explicitly requests a new code. This prevents the current code from
-  // disappearing due to an async connection-close event.
-  const failedAttempt =
-    dbSession.status === "ERROR" ||
-    (memorySession &&
-      !memorySession.registered &&
-      (memorySession.status === "ERROR" || memorySession.lastError));
+  const pairingPhone = phone || user.phone_e164;
+  const existingFlow = managedPairingFlows.get(dbSession.id) || null;
+  const hadVisibleCode = managedPairingCodeIsVisible(existingFlow);
 
-  if (failedAttempt) {
-    resetFailedPairingSession(dbSession.id);
-    memorySession = null;
-  }
-
-  const session =
-    memorySession ||
-    (await startSession(dbSession.id, {
-      userId,
-    }));
-
-  const pairing = await requestPairingCode({
+  const flow = ensureManagedPairingFlow({
     sessionId: dbSession.id,
     userId,
-    phone: phone || user.phone_e164,
+    phone: pairingPhone,
   });
 
+  // A POST while a code is already visible means the user explicitly tapped
+  // "Generate new code". Rotate immediately. Ordinary frontend polling uses
+  // GET and therefore never rotates the code by accident.
+  if (hadVisibleCode) {
+    clearManagedPairingTimers(flow);
+    flow.failureCount = 0;
+    invalidateManagedPairingCode(flow);
+
+    if (isCurrentSession(session)) {
+      session.pairingCode = null;
+      session.pairingCodeIssuedAt = null;
+      session.status = "STARTING";
+      session.lastError = null;
+
+      await persistSessionState(session, {
+        status: "STARTING",
+      });
+    }
+  }
+
+  // A terminal/exhausted previous attempt must start with a completely fresh
+  // auth directory. A registered CONNECTED session is handled above and is
+  // never deleted here.
+  if (!session?.registered && !flow.requestInFlight && !flow.retryTimer) {
+    if (
+      !session ||
+      !isCurrentSession(session) ||
+      dbSession.status === "ERROR" ||
+      dbSession.status === "LOGGED_OUT" ||
+      dbSession.status === "DISCONNECTED"
+    ) {
+      if (session && isCurrentSession(session)) {
+        dropSocketSession(session, {
+          removeAuth: true,
+          reason: "Starting fresh managed WhatsApp pairing",
+        });
+      } else {
+        removeAuthDirectory(dbSession.id);
+      }
+
+      session = await startSession(dbSession.id, {
+        userId,
+      });
+    }
+
+    void ensureManagedPairingAttempt(flow, {
+      reason: hadVisibleCode ? "manual_refresh" : "manual_start",
+      forceNewCode: hadVisibleCode,
+    });
+  }
+
   const latest = await repository.getWhatsappSessionByUser(userId);
-  return {
-    ...normalizeManagedSession(latest, session),
-    pairingCode: pairing,
-  };
+  return normalizeManagedSession(latest, sessions.get(dbSession.id) || session);
 }
 
 export async function refreshManagedQr(userId) {
@@ -1388,6 +1999,8 @@ export async function retryManagedSession(userId) {
     });
   }
 
+  stopManagedPairingFlow(dbSession.id);
+
   const current = sessions.get(dbSession.id);
 
   if (current) {
@@ -1409,6 +2022,8 @@ export async function retryManagedSession(userId) {
 }
 
 export async function disconnectSession(sessionId) {
+  stopManagedPairingFlow(sessionId);
+
   const session = sessions.get(sessionId);
 
   if (session) {
@@ -1474,18 +2089,55 @@ function normalizeManagedSession(dbSession, memorySession) {
     return null;
   }
 
-  const status = memorySession?.status || dbSession?.status || "DISCONNECTED";
+  const sessionId = memorySession?.id || dbSession?.id || null;
+  const managedFlow = sessionId
+    ? managedPairingFlows.get(sessionId) || null
+    : null;
+
+  let status = memorySession?.status || dbSession?.status || "DISCONNECTED";
+
+  // While automatic pairing is active, QR is only an internal readiness
+  // signal. The user-facing state remains STARTING until a phone code is
+  // published, refreshed, connected, or the bounded retry circuit opens.
+  if (
+    managedFlow?.active &&
+    status !== "CONNECTED" &&
+    status !== "RECONNECTING"
+  ) {
+    status = "STARTING";
+  }
+
   const qrDataUrl = memorySession?.qr || null;
   const qrIssuedAt = memorySession?.qrIssuedAt || null;
-  const pairingCode = pairingCodeIsFresh(memorySession)
+
+  const managedCode = managedPairingCodeIsVisible(managedFlow)
+    ? managedFlow.code
+    : null;
+
+  const legacyCode = legacyPairingCodeIsFresh(memorySession)
     ? memorySession.pairingCode
     : null;
-  const pairingIssuedAt = pairingCode
+
+  const pairingCode = managedCode || legacyCode;
+  const pairingIssuedAt = managedCode
+    ? managedFlow.codeIssuedAt
+    : legacyCode
     ? memorySession?.pairingCodeIssuedAt || null
+    : null;
+  const pairingPhone = managedCode
+    ? managedFlow.phone
+    : memorySession?.pairingPhone || null;
+  const pairingDisplayExpiresAt = managedCode
+    ? managedFlow.codeRotatesAt
+    : pairingIssuedAt
+    ? new Date(
+        new Date(pairingIssuedAt).getTime() +
+          LEGACY_PAIRING_CODE_DISPLAY_TTL
+      ).toISOString()
     : null;
 
   return {
-    sessionId: memorySession?.id || dbSession?.id || null,
+    sessionId,
     status: toFrontendWhatsappStatus(status),
     account:
       dbSession?.whatsapp_phone || dbSession?.display_name
@@ -1507,18 +2159,15 @@ function normalizeManagedSession(dbSession, memorySession) {
     pairingCode: pairingCode
       ? {
           code: pairingCode,
-          phone: memorySession?.pairingPhone || null,
+          phone: pairingPhone,
           issuedAt: pairingIssuedAt,
-          // Informational UI TTL only. WhatsApp owns the real validity window.
-          displayExpiresAt: pairingIssuedAt
-            ? new Date(
-                new Date(pairingIssuedAt).getTime() +
-                  PAIRING_CODE_DISPLAY_TTL
-              ).toISOString()
-            : null,
+          // This is the planned automatic rotation time, not a claim that
+          // WhatsApp guarantees validity until this exact timestamp.
+          displayExpiresAt: pairingDisplayExpiresAt,
         }
       : null,
-    error: memorySession?.lastError || null,
+    error:
+      managedFlow?.lastError || memorySession?.lastError || null,
   };
 }
 
@@ -1582,6 +2231,31 @@ async function restoreManagedSessions() {
     }
 
     if (["LOGGED_OUT", "DISCONNECTED"].includes(dbSession.status)) {
+      continue;
+    }
+
+    // Phone pairing is intentionally memory-driven and auto-rotating. After a
+    // process restart there is no trustworthy live code/timer to resume. Clear
+    // half-finished pairing auth instead of reviving stale credentials. Fully
+    // registered CONNECTED/RECONNECTING sessions still restore normally.
+    if (["STARTING", "QR", "ERROR"].includes(dbSession.status)) {
+      removeAuthDirectory(dbSession.id);
+
+      await repository.updateWhatsappSessionById(dbSession.id, {
+        status: "DISCONNECTED",
+      });
+
+      void writeSystemLog({
+        userId: dbSession.user_id,
+        sessionId: dbSession.id,
+        level: "info",
+        source: "whatsapp",
+        event: "pairing_reset_after_restart",
+        message:
+          "Incomplete WhatsApp pairing was reset after process restart",
+        details: { previousStatus: dbSession.status },
+      });
+
       continue;
     }
 
