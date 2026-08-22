@@ -17,7 +17,16 @@ function parseCsv(value) {
 
 export const PORT = Number(process.env.PORT) || 3001;
 
-export const DATA_DIR = process.env.DATA_DIR || "./data";
+// Railway automatically exposes the attached persistent volume mount path.
+// Prefer an explicit DATA_DIR when supplied, otherwise use that mount path.
+// Local development still falls back to ./data.
+export const RAILWAY_VOLUME_MOUNT_PATH =
+  process.env.RAILWAY_VOLUME_MOUNT_PATH || "";
+
+export const DATA_DIR =
+  process.env.DATA_DIR ||
+  RAILWAY_VOLUME_MOUNT_PATH ||
+  "./data";
 
 export const N8N_WEBHOOK_URL =
   process.env.N8N_WEBHOOK_URL || null;
