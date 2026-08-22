@@ -22,3 +22,17 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run check
+      - name: Materialize final patched WhatsApp source
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from "node:fs/promises";
+          import { materializeCurrentPatchedWhatsapp } from "./test/helpers/materializePatchedWhatsapp.js";
+          const materialized = await materializeCurrentPatchedWhatsapp();
+          await fs.writeFile("materialized-whatsapp.js", materialized.source, "utf8");
+          await materialized.cleanup();
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: materialized-whatsapp
+          path: materialized-whatsapp.js
+          if-no-files-found: error
