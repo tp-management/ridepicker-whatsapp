@@ -39,11 +39,12 @@ export function createApp() {
     })
   );
 
-  // WhatsApp can be removed remotely from the phone's Linked Devices screen.
-  // In that case Supabase is already LOGGED_OUT/DISCONNECTED, while an old
-  // Baileys object in this process can still have registered=true. Clean that
-  // stale runtime/auth state before the existing pairing-code route runs so a
-  // fresh code can be generated immediately without a manual backend restart.
+  // A POST to the pairing-code endpoint is an explicit request for a fresh
+  // code. Any non-CONNECTED state is therefore safe to reset first, including
+  // STARTING/QR where Baileys may already have creds.registered=true before the
+  // device has ever reached connection=open. This prevents an incomplete
+  // pairing from being mistaken for a live WhatsApp connection and blocking
+  // "Generate new code" with a false 409.
   app.use(async (req, res, next) => {
     if (req.method !== "POST" || !isSupabaseConfigured()) {
       return next();
@@ -60,10 +61,7 @@ export function createApp() {
     try {
       const dbSession = await repository.getWhatsappSessionByUser(match[1]);
 
-      if (
-        dbSession &&
-        ["LOGGED_OUT", "DISCONNECTED"].includes(dbSession.status)
-      ) {
+      if (dbSession && dbSession.status !== "CONNECTED") {
         await disconnectSession(dbSession.id);
       }
     } catch (error) {
