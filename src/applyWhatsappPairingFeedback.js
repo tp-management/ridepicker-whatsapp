@@ -46,6 +46,18 @@ export function applyWhatsappPairingFeedback() {
     "bounded 408 expiry classification"
   );
 
+  // Pairing can be triggered both by the explicit POST and by the QR-ready
+  // lifecycle event. The old code acquired requestInFlight only after awaits,
+  // so both callers could pass the guard and issue two companion_hello queries
+  // against the same session. Acquire the lock before the first await and keep
+  // socket creation inside the guarded try/finally so every exit releases it.
+  source = replaceExactlyOnce(
+    source,
+    `async function ensureManagedPairingAttempt(\n  flow,\n  { reason = 'initial', forceNewCode = false } = {}\n) {\n  if (!flow?.active || flow.requestInFlight || flow.retryTimer) {\n    return null;\n  }\n\n  if (managedPairingCodeIsVisible(flow) && !forceNewCode) {\n    return {\n      code: flow.code,\n      issuedAt: flow.codeIssuedAt,\n      phone: flow.phone,\n      displayExpiresAt: flow.codeRotatesAt,\n    };\n  }\n\n  let session = sessions.get(flow.sessionId);\n\n  if (!isCurrentSession(session) || !session.socket) {\n    session = await startSession(flow.sessionId, {\n      userId: flow.userId,\n    });\n  }\n\n  if (session.registered) {\n    stopManagedPairingFlow(flow.sessionId);\n    return null;\n  }\n\n  flow.requestInFlight = true;\n  const attemptToken = ++flow.attemptToken;\n  const socket = session.socket;\n\n  try {`,
+    `async function ensureManagedPairingAttempt(\n  flow,\n  { reason = 'initial', forceNewCode = false } = {}\n) {\n  if (!flow?.active || flow.retryTimer) {\n    return null;\n  }\n\n  if (managedPairingCodeIsVisible(flow) && !forceNewCode) {\n    return {\n      code: flow.code,\n      issuedAt: flow.codeIssuedAt,\n      phone: flow.phone,\n      displayExpiresAt: flow.codeRotatesAt,\n    };\n  }\n\n  if (flow.requestInFlight) {\n    return null;\n  }\n\n  flow.requestInFlight = true;\n  const attemptToken = ++flow.attemptToken;\n  let session = null;\n\n  try {\n    session = sessions.get(flow.sessionId);\n\n    if (!isCurrentSession(session) || !session.socket) {\n      session = await startSession(flow.sessionId, {\n        userId: flow.userId,\n      });\n    }\n\n    if (\n      !flow.active ||\n      attemptToken !== flow.attemptToken ||\n      !isCurrentSession(session)\n    ) {\n      return null;\n    }\n\n    if (session.registered) {\n      stopManagedPairingFlow(flow.sessionId);\n      return null;\n    }\n\n    const socket = session.socket;`,
+    "single-flight pairing attempt"
+  );
+
   source = replaceExactlyOnce(
     source,
     `  const phoneChanged = flow.phoneDigits !== digits;\n  const restartingAfterTerminalError = !flow.active;\n\n  if (phoneChanged || restartingAfterTerminalError) {`,
