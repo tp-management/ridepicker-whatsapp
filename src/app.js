@@ -2,10 +2,7 @@ import express from "express";
 import cors from "cors";
 
 import { FRONTEND_ORIGINS } from "./config.js";
-import { repository } from "./repository.js";
 import router from "./routes.js";
-import { isSupabaseConfigured } from "./supabase.js";
-import { disconnectSession } from "./whatsapp.js";
 
 export function createApp() {
   const app = express();
@@ -39,44 +36,10 @@ export function createApp() {
     })
   );
 
-  // A POST to the pairing-code endpoint is an explicit request for a fresh
-  // code. Any non-CONNECTED state is therefore safe to reset first, including
-  // STARTING/QR where Baileys may already have creds.registered=true before the
-  // device has ever reached connection=open. This prevents an incomplete
-  // pairing from being mistaken for a live WhatsApp connection and blocking
-  // "Generate new code" with a false 409.
-  app.use(async (req, res, next) => {
-    if (req.method !== "POST" || !isSupabaseConfigured()) {
-      return next();
-    }
-
-    const match = req.path.match(
-      /^\/api\/users\/([^/]+)\/whatsapp\/pairing-code\/?$/
-    );
-
-    if (!match) {
-      return next();
-    }
-
-    try {
-      const dbSession = await repository.getWhatsappSessionByUser(match[1]);
-
-      if (dbSession && dbSession.status !== "CONNECTED") {
-        await disconnectSession(dbSession.id);
-      }
-    } catch (error) {
-      // Let the existing route produce its normal API error response if the
-      // database is temporarily unavailable. This pre-clean must not replace
-      // the established error contract.
-      console.error(
-        "[whatsapp] pre-pairing stale session cleanup failed:",
-        error.message
-      );
-    }
-
-    next();
-  });
-
+  // Pairing lifecycle ownership belongs inside requestManagedPairingCode().
+  // Do not reset a WhatsApp session in generic HTTP middleware: concurrent
+  // POSTs, browser retries, or a double-click could otherwise destroy the
+  // socket that another request is actively using to register a pairing code.
   app.use(router);
 
   app.use((error, req, res, next) => {
