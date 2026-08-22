@@ -12,6 +12,7 @@ import makeWASocket, {
 import {
   DATA_DIR,
   N8N_FORWARD_MEDIA_WITHOUT_TEXT,
+  N8N_FORWARD_FROM_ME,
   N8N_FORWARD_SESSION_EVENTS,
   N8N_WEBHOOK_URL,
   RESTORE_LEGACY_SESSIONS,
@@ -479,7 +480,8 @@ async function processMessage(session, socket, message) {
       has_media: Boolean(media),
       media,
       message_timestamp: messageTimestamp,
-      processing_status: fromMe ? "ignored" : "new",
+      processing_status:
+        fromMe && !N8N_FORWARD_FROM_ME ? "ignored" : "new",
     });
   } catch (error) {
     // The DB trigger is our second line of defence against OFF/history messages.
@@ -513,9 +515,11 @@ async function processMessage(session, socket, message) {
     body || `[${messageType}]`
   );
 
-  // Outgoing messages are useful conversation context, but they do NOT create
-  // n8n executions. This also prevents the bot from replying to itself.
-  if (fromMe) {
+  // By default outgoing messages are context-only. For temporary testing,
+  // N8N_FORWARD_FROM_ME=true also forwards manually sent messages to n8n.
+  // IMPORTANT: turn this back off before automated replies/autopilot are enabled
+  // to avoid feeding bot-generated outbound messages back into the AI pipeline.
+  if (fromMe && !N8N_FORWARD_FROM_ME) {
     return;
   }
 
@@ -543,7 +547,8 @@ async function processMessage(session, socket, message) {
       senderName,
       participant,
       participantAlt,
-      fromMe: false,
+      fromMe,
+      direction: fromMe ? "outgoing" : "incoming",
       body,
       type: messageType,
       hasMedia: Boolean(media),

@@ -32,6 +32,11 @@ export const N8N_FORWARD_MEDIA_WITHOUT_TEXT = parseBoolean(
   false
 );
 
+export const N8N_FORWARD_FROM_ME = parseBoolean(
+  process.env.N8N_FORWARD_FROM_ME,
+  false
+);
+
 export const SUPABASE_URL =
   process.env.SUPABASE_URL || "";
 
