@@ -2,6 +2,7 @@ import express from "express";
 
 import { INTERNAL_API_KEY } from "./config.js";
 import { repository } from "./repository.js";
+import { writeSystemLog } from "./systemLog.js";
 import { isSupabaseConfigured } from "./supabase.js";
 import { createHttpError } from "./utils.js";
 import {
@@ -305,6 +306,19 @@ router.put(
           mode === "off"
             ? "Monitoring stopped."
             : "Monitoring new WhatsApp messages and detecting jobs.",
+      });
+
+      void writeSystemLog({
+        userId: req.params.userId,
+        sessionId: updated?.id || session?.id || null,
+        level: "info",
+        source: "ridepicker",
+        event: "bot_mode_changed",
+        message:
+          mode === "off"
+            ? "RidePicker monitoring turned off"
+            : "RidePicker Assist enabled",
+        details: { mode },
       });
 
       res.json({

@@ -19,6 +19,7 @@ import {
   SESSION_POLICY_CACHE_MS,
 } from "./config.js";
 import { repository } from "./repository.js";
+import { writeSystemLog } from "./systemLog.js";
 import { isSupabaseConfigured } from "./supabase.js";
 import {
   isoFromWhatsappTimestamp,
@@ -51,6 +52,26 @@ const TRACKABLE_MESSAGE_TYPES = new Set([
   "location",
   "contact",
 ]);
+
+function logWhatsappEvent(
+  session,
+  level,
+  event,
+  message = null,
+  details = {}
+) {
+  // Do not await persistent logging inside Baileys lifecycle handlers.
+  // Logging must never slow down or break the WhatsApp handshake.
+  void writeSystemLog({
+    userId: session?.userId || null,
+    sessionId: session?.userId ? session?.id || null : null,
+    level,
+    source: "whatsapp",
+    event,
+    message,
+    details,
+  });
+}
 
 function authPathFor(sessionId) {
   return path.join(DATA_DIR, sessionId);
@@ -315,13 +336,59 @@ async function sendToN8n(event) {
     if (!response.ok) {
       const body = await response.text();
       console.error(`[n8n] ${response.status}:`, body);
+
+      void writeSystemLog({
+        userId: event?.userId || null,
+        sessionId: event?.session || null,
+        level: "error",
+        source: "n8n",
+        event: "n8n_failed",
+        message: `n8n returned HTTP ${response.status}`,
+        details: {
+          httpStatus: response.status,
+          outboundEvent: event?.event || null,
+          dbMessageId: event?.payload?.dbMessageId || null,
+        },
+      });
+
       return false;
     }
 
     console.log(`[n8n] delivered: ${event.event}`);
+
+    void writeSystemLog({
+      userId: event?.userId || null,
+      sessionId: event?.session || null,
+      level: "info",
+      source: "n8n",
+      event:
+        event?.event === "message.received"
+          ? "message_forwarded_to_n8n"
+          : "event_forwarded_to_n8n",
+      message: `Delivered ${event?.event || "event"} to n8n`,
+      details: {
+        outboundEvent: event?.event || null,
+        dbMessageId: event?.payload?.dbMessageId || null,
+      },
+    });
+
     return true;
   } catch (error) {
     console.error("[n8n] webhook error:", error.message);
+
+    void writeSystemLog({
+      userId: event?.userId || null,
+      sessionId: event?.session || null,
+      level: "error",
+      source: "n8n",
+      event: "n8n_failed",
+      message: error.message,
+      details: {
+        outboundEvent: event?.event || null,
+        dbMessageId: event?.payload?.dbMessageId || null,
+      },
+    });
+
     return false;
   }
 }
@@ -655,6 +722,12 @@ export async function startSession(
 
     if (!wasRegistered && session.registered) {
       console.log(`[${id}] WhatsApp credentials registered`);
+      logWhatsappEvent(
+        session,
+        "info",
+        "credentials_registered",
+        "WhatsApp credentials registered"
+      );
     }
   });
 
@@ -671,6 +744,12 @@ export async function startSession(
       session.status = "QR";
 
       console.log(`[${id}] QR ready`);
+      logWhatsappEvent(
+        session,
+        "info",
+        "qr_ready",
+        "WhatsApp QR fallback is ready"
+      );
 
       await persistSessionState(session, {
         status: "QR",
@@ -697,6 +776,14 @@ export async function startSession(
           `[${id}] refusing false CONNECTED state: credentials are not registered`
         );
 
+        logWhatsappEvent(
+          session,
+          "error",
+          "connection_validation_failed",
+          "Socket opened without confirmed registered credentials",
+          { code: "UNREGISTERED_OPEN" }
+        );
+
         await persistSessionState(session, {
           status: "ERROR",
         });
@@ -717,6 +804,12 @@ export async function startSession(
       const connectedAt = new Date().toISOString();
 
       console.log(`[${id}] WhatsApp connected`);
+      logWhatsappEvent(
+        session,
+        "info",
+        "whatsapp_connected",
+        "WhatsApp connected"
+      );
 
       await persistSessionState(session, {
         status: "CONNECTED",
@@ -753,6 +846,18 @@ export async function startSession(
         })
       );
 
+      logWhatsappEvent(
+        session,
+        "warning",
+        "whatsapp_connection_closed",
+        message,
+        {
+          statusCode,
+          registered: session.registered,
+          pairingAttemptActive: session.pairingAttemptActive,
+        }
+      );
+
       session.socket = null;
       session.lastError = {
         code: statusCode,
@@ -769,6 +874,13 @@ export async function startSession(
         session.pairingAttemptActive = false;
 
         console.log(`[${id}] WhatsApp logged out`);
+        logWhatsappEvent(
+          session,
+          "info",
+          "whatsapp_logged_out",
+          "WhatsApp logged out",
+          { statusCode }
+        );
 
         await persistSessionState(session, {
           status: "LOGGED_OUT",
@@ -802,6 +914,13 @@ export async function startSession(
         console.log(
           `[${id}] WhatsApp requested restart after pairing/authentication`
         );
+        logWhatsappEvent(
+          session,
+          "info",
+          "whatsapp_restart_required",
+          "WhatsApp requested restart after pairing/authentication",
+          { statusCode }
+        );
 
         await persistSessionState(session, {
           status: "RECONNECTING",
@@ -818,6 +937,13 @@ export async function startSession(
               });
             } catch (error) {
               console.error(`[${id}] restart failed:`, error);
+              logWhatsappEvent(
+                session,
+                "error",
+                "restart_failed",
+                error.message,
+                { error }
+              );
 
               await persistSessionState(session, {
                 status: "ERROR",
@@ -844,6 +970,13 @@ export async function startSession(
           `[${id}] pairing failed before credentials were registered`,
           JSON.stringify({ statusCode, message })
         );
+        logWhatsappEvent(
+          session,
+          "error",
+          "pairing_failed",
+          message,
+          { statusCode, registered: session.registered }
+        );
 
         await persistSessionState(session, {
           status: "ERROR",
@@ -854,6 +987,13 @@ export async function startSession(
 
       session.status = "RECONNECTING";
       console.log(`[${id}] reconnecting...`);
+      logWhatsappEvent(
+        session,
+        "warning",
+        "reconnect_started",
+        "WhatsApp reconnect started",
+        { statusCode, reason: message }
+      );
 
       // Do NOT change bot_mode here. Assist remains enabled and resumes when
       // WhatsApp comes back.
@@ -879,6 +1019,13 @@ export async function startSession(
             });
           } catch (error) {
             console.error(`[${id}] reconnect failed:`, error);
+            logWhatsappEvent(
+              session,
+              "error",
+              "reconnect_failed",
+              error.message,
+              { error }
+            );
 
             await persistSessionState(session, {
               status: "ERROR",
@@ -901,6 +1048,13 @@ export async function startSession(
         console.error(
           `[${id}] message processing failed:`,
           error.message
+        );
+        logWhatsappEvent(
+          session,
+          "error",
+          "message_processing_failed",
+          error.message,
+          { whatsappMessageId: message?.key?.id || null }
         );
       }
     }
@@ -968,6 +1122,12 @@ export async function requestPairingCode({
     console.log(
       `[${sessionId}] requesting pairing code for +${digits}`
     );
+    logWhatsappEvent(
+      session,
+      "info",
+      "pairing_started",
+      "WhatsApp pairing code requested"
+    );
 
     const code = await session.socket.requestPairingCode(digits);
 
@@ -976,6 +1136,12 @@ export async function requestPairingCode({
     session.pairingPhone = `+${digits}`;
 
     console.log(`[${sessionId}] pairing code ready`);
+    logWhatsappEvent(
+      session,
+      "info",
+      "pairing_code_created",
+      "WhatsApp pairing code created"
+    );
 
     await persistSessionState(session, {
       status: "STARTING",
@@ -999,6 +1165,16 @@ export async function requestPairingCode({
     console.error(
       `[${sessionId}] pairing code request failed:`,
       error
+    );
+    logWhatsappEvent(
+      session,
+      "error",
+      "pairing_failed",
+      error.message,
+      {
+        statusCode:
+          error?.output?.statusCode || error?.statusCode || null,
+      }
     );
 
     await persistSessionState(session, {
@@ -1216,6 +1392,16 @@ export async function disconnectManagedSession(userId) {
     detail: "",
   });
 
+  void writeSystemLog({
+    userId,
+    sessionId: dbSession.id,
+    level: "info",
+    source: "whatsapp",
+    event: "whatsapp_disconnected",
+    message: "WhatsApp disconnected by user",
+    details: { reason: "manual_disconnect" },
+  });
+
   return normalizeManagedSession(updated, null);
 }
 
@@ -1310,6 +1496,16 @@ async function restoreManagedSessions() {
       if (
         !["LOGGED_OUT", "DISCONNECTED"].includes(dbSession.status)
       ) {
+        void writeSystemLog({
+          userId: dbSession.user_id,
+          sessionId: dbSession.id,
+          level: "warning",
+          source: "whatsapp",
+          event: "auth_state_missing",
+          message: "WhatsApp auth directory is missing during restore",
+          details: { previousStatus: dbSession.status },
+        });
+
         await repository.updateWhatsappSessionById(dbSession.id, {
           status: "DISCONNECTED",
         });
@@ -1322,6 +1518,15 @@ async function restoreManagedSessions() {
     }
 
     console.log(`Restoring managed session: ${dbSession.id}`);
+    void writeSystemLog({
+      userId: dbSession.user_id,
+      sessionId: dbSession.id,
+      level: "info",
+      source: "whatsapp",
+      event: "session_restore_started",
+      message: "Restoring managed WhatsApp session",
+      details: { previousStatus: dbSession.status },
+    });
 
     try {
       await startSession(dbSession.id, {
@@ -1332,6 +1537,15 @@ async function restoreManagedSessions() {
         `Failed restoring managed session ${dbSession.id}:`,
         error
       );
+      void writeSystemLog({
+        userId: dbSession.user_id,
+        sessionId: dbSession.id,
+        level: "error",
+        source: "whatsapp",
+        event: "session_restore_failed",
+        message: error.message,
+        details: { error },
+      });
     }
   }
 
