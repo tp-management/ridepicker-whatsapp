@@ -2094,7 +2094,16 @@ function normalizeManagedSession(dbSession, memorySession) {
     ? managedPairingFlows.get(sessionId) || null
     : null;
 
-  let status = memorySession?.status || dbSession?.status || "DISCONNECTED";
+  // Supabase is the authoritative source for terminal connection state.
+  // The in-memory Baileys session can remain around briefly after a remote
+  // Linked Device removal, so never let stale runtime state resurrect a
+  // CONNECTED UI after the database has recorded LOGGED_OUT/DISCONNECTED.
+  const dbStatus = dbSession?.status || null;
+  const terminalDbStatus = new Set(["LOGGED_OUT", "DISCONNECTED"]);
+  let status =
+    dbStatus && terminalDbStatus.has(dbStatus)
+      ? dbStatus
+      : memorySession?.status || dbStatus || "DISCONNECTED";
 
   // While automatic pairing is active, QR is only an internal readiness
   // signal. The user-facing state remains STARTING until a phone code is
