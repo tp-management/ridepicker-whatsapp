@@ -1,8 +1,10 @@
 import { applyWhatsappPairingHardening } from "./src/applyWhatsappPairingHardening.js";
 import { applyWhatsappPairingHelloAck } from "./src/applyWhatsappPairingHelloAck.js";
+import { applyWhatsappPairingUx } from "./src/applyWhatsappPairingUx.js";
 
 applyWhatsappPairingHardening();
 applyWhatsappPairingHelloAck();
+applyWhatsappPairingUx();
 
 const [{ createApp }, { PORT, SUPABASE_CONFIGURED }, { restoreSessions }] =
   await Promise.all([
