@@ -45,6 +45,21 @@ const BINDING_KEYS = new Set([
   "scope",
 ]);
 
+const WHATSAPP_JID_PATTERN =
+  /(?:[a-z0-9._+-]+|\d+(?::\d+)?)@(?:s\.whatsapp\.net|lid|c\.us|g\.us|broadcast|newsletter)/gi;
+const PHONE_IDENTIFIER_PATTERN =
+  /(?<![\w@])\+?\d(?:[\s().-]*\d){6,14}(?![\w@])/g;
+
+export function sanitizeBaileysLogText(value) {
+  if (typeof value !== "string") {
+    return value ?? null;
+  }
+
+  return value
+    .replace(WHATSAPP_JID_PATTERN, "[redacted-jid]")
+    .replace(PHONE_IDENTIFIER_PATTERN, "[redacted-phone]");
+}
+
 function exactMessage(args) {
   for (let index = args.length - 1; index >= 0; index -= 1) {
     if (typeof args[index] === "string") {
@@ -73,7 +88,11 @@ function errorDiagnostics(error) {
 
   const output = {};
   const name = scalar(error.name);
-  const message = scalar(error.message);
+  const rawMessage = scalar(error.message);
+  const message =
+    typeof rawMessage === "string"
+      ? sanitizeBaileysLogText(rawMessage)
+      : rawMessage;
   const code = scalar(error.code);
   const statusCode =
     scalar(error.statusCode) ??
@@ -134,7 +153,13 @@ function pickBindings(bindings) {
   return output;
 }
 
-function makeLogger({ userId, sessionId, bindings = {}, minLevel = MIN_LEVEL }) {
+function makeLogger({
+  userId,
+  sessionId,
+  bindings = {},
+  minLevel = MIN_LEVEL,
+  writeLog = writeSystemLog,
+}) {
   const threshold = LEVEL_VALUE[minLevel] ?? LEVEL_VALUE.debug;
   const enabled = (level) => (LEVEL_VALUE[level] ?? Infinity) >= threshold;
 
@@ -144,13 +169,13 @@ function makeLogger({ userId, sessionId, bindings = {}, minLevel = MIN_LEVEL }) 
     const diagnostics = pickDiagnostics(args);
     const safeBindings = pickBindings(bindings);
 
-    void writeSystemLog({
+    void writeLog({
       userId,
       sessionId,
       level: LEVEL_MAP[baileysLevel] || "info",
       source: "baileys_raw",
       event: "log",
-      message: exactMessage(args),
+      message: sanitizeBaileysLogText(exactMessage(args)),
       details: {
         baileysLevel,
         ...(Object.keys(safeBindings).length ? { bindings: safeBindings } : {}),
@@ -170,6 +195,7 @@ function makeLogger({ userId, sessionId, bindings = {}, minLevel = MIN_LEVEL }) 
         userId,
         sessionId,
         minLevel,
+        writeLog,
         bindings: {
           ...bindings,
           ...childBindings,
@@ -198,10 +224,15 @@ function makeLogger({ userId, sessionId, bindings = {}, minLevel = MIN_LEVEL }) 
   };
 }
 
-export function createBaileysRawLogger({ userId = null, sessionId = null } = {}) {
+export function createBaileysRawLogger({
+  userId = null,
+  sessionId = null,
+  writeLog = writeSystemLog,
+} = {}) {
   return makeLogger({
     userId,
     sessionId,
     bindings: {},
+    writeLog,
   });
 }
