@@ -9,6 +9,42 @@ const LEVEL_MAP = {
   fatal: "error",
 };
 
+const LEVEL_VALUE = {
+  trace: 10,
+  debug: 20,
+  info: 30,
+  warn: 40,
+  error: 50,
+  fatal: 60,
+};
+
+const MIN_LEVEL = "debug";
+
+const DIAGNOSTIC_KEYS = new Set([
+  "statusCode",
+  "code",
+  "reason",
+  "type",
+  "tag",
+  "xmlns",
+  "msgId",
+  "connection",
+  "retryCount",
+  "attempt",
+  "timeoutMs",
+  "isOnline",
+  "isNewLogin",
+  "receivedPendingNotifications",
+  "shouldSyncHistoryMessage",
+]);
+
+const BINDING_KEYS = new Set([
+  "class",
+  "component",
+  "module",
+  "scope",
+]);
+
 function exactMessage(args) {
   for (let index = args.length - 1; index >= 0; index -= 1) {
     if (typeof args[index] === "string") {
@@ -24,8 +60,90 @@ function exactMessage(args) {
   return null;
 }
 
-function makeLogger({ userId, sessionId, bindings = {} }) {
+function scalar(value) {
+  return ["string", "number", "boolean"].includes(typeof value)
+    ? value
+    : null;
+}
+
+function errorDiagnostics(error) {
+  if (!error || typeof error !== "object") {
+    return null;
+  }
+
+  const output = {};
+  const name = scalar(error.name);
+  const message = scalar(error.message);
+  const code = scalar(error.code);
+  const statusCode =
+    scalar(error.statusCode) ??
+    scalar(error.status) ??
+    scalar(error?.output?.statusCode) ??
+    scalar(error?.output?.payload?.statusCode);
+
+  if (name !== null) output.name = name;
+  if (message !== null) output.message = message;
+  if (code !== null) output.code = code;
+  if (statusCode !== null) output.statusCode = statusCode;
+
+  return Object.keys(output).length ? output : null;
+}
+
+function pickDiagnostics(args) {
+  const diagnostics = {};
+
+  for (const arg of args) {
+    if (!arg || typeof arg !== "object") continue;
+
+    const directError = arg instanceof Error ? errorDiagnostics(arg) : null;
+    if (directError) {
+      diagnostics.error = directError;
+      continue;
+    }
+
+    for (const key of DIAGNOSTIC_KEYS) {
+      if (!Object.prototype.hasOwnProperty.call(arg, key)) continue;
+
+      const value = scalar(arg[key]);
+      if (value !== null) {
+        diagnostics[key] = value;
+      }
+    }
+
+    const nestedError = errorDiagnostics(arg.err || arg.error);
+    if (nestedError) {
+      diagnostics.error = nestedError;
+    }
+  }
+
+  return diagnostics;
+}
+
+function pickBindings(bindings) {
+  const output = {};
+
+  for (const key of BINDING_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(bindings, key)) continue;
+
+    const value = scalar(bindings[key]);
+    if (value !== null) {
+      output[key] = value;
+    }
+  }
+
+  return output;
+}
+
+function makeLogger({ userId, sessionId, bindings = {}, minLevel = MIN_LEVEL }) {
+  const threshold = LEVEL_VALUE[minLevel] ?? LEVEL_VALUE.debug;
+  const enabled = (level) => (LEVEL_VALUE[level] ?? Infinity) >= threshold;
+
   const emit = (baileysLevel, args) => {
+    if (!enabled(baileysLevel)) return;
+
+    const diagnostics = pickDiagnostics(args);
+    const safeBindings = pickBindings(bindings);
+
     void writeSystemLog({
       userId,
       sessionId,
@@ -35,22 +153,23 @@ function makeLogger({ userId, sessionId, bindings = {} }) {
       message: exactMessage(args),
       details: {
         baileysLevel,
-        bindings,
-        args,
+        ...(Object.keys(safeBindings).length ? { bindings: safeBindings } : {}),
+        ...(Object.keys(diagnostics).length ? { diagnostics } : {}),
       },
     });
   };
 
   return {
-    // Baileys checks logger.level in a few hot paths. Keep trace disabled so
-    // encrypted/XMPP wire dumps are not persisted, while native debug/info/
-    // warn/error logger calls are captured exactly as Baileys emitted them.
-    level: "debug",
+    // Baileys uses logger.level for a few explicit guards, but also contains
+    // unguarded logger.trace() calls. The methods below therefore enforce the
+    // threshold themselves as the actual persistence boundary.
+    level: minLevel,
 
     child(childBindings = {}) {
       return makeLogger({
         userId,
         sessionId,
+        minLevel,
         bindings: {
           ...bindings,
           ...childBindings,
