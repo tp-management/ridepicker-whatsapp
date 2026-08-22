@@ -34,6 +34,18 @@ export function applyWhatsappPairingFeedback() {
     "feedback marker"
   );
 
+  // Hardening V1 used to classify every Baileys 408 as ordinary code expiry.
+  // That turns transport/handshake timeouts into an unbounded immediate retry
+  // loop. Only a code that was actually published and has lived close to the
+  // expected WhatsApp expiry window is allowed to take the zero-delay refresh
+  // path. Early 408s go through the normal bounded circuit breaker instead.
+  source = replaceExactlyOnce(
+    source,
+    `  const naturalExpiry =\n    statusCode === DisconnectReason.timedOut;`,
+    `  const naturalExpiry =\n    statusCode === DisconnectReason.timedOut &&\n    flow.published &&\n    codeAgeMs >= MANAGED_PAIRING_NATURAL_EXPIRY_MIN_AGE_MS;`,
+    "bounded 408 expiry classification"
+  );
+
   source = replaceExactlyOnce(
     source,
     `  const phoneChanged = flow.phoneDigits !== digits;\n  const restartingAfterTerminalError = !flow.active;\n\n  if (phoneChanged || restartingAfterTerminalError) {`,
