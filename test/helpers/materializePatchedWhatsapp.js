@@ -25,7 +25,7 @@ export async function materializeCurrentPatchedWhatsapp({
     repoRoot,
     "test",
     "fixtures",
-    "whatsapp.pre-canonical.js"
+    "whatsapp.pre-canonical.fixture"
   ),
 } = {}) {
   const tempRoot = await fs.mkdtemp(
