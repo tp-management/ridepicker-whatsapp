@@ -2,11 +2,13 @@ import { applyWhatsappPairingHardening } from "./src/applyWhatsappPairingHardeni
 import { applyWhatsappPairingHelloAck } from "./src/applyWhatsappPairingHelloAck.js";
 import { applyWhatsappPairingUx } from "./src/applyWhatsappPairingUx.js";
 import { applyWhatsappPairingFeedback } from "./src/applyWhatsappPairingFeedback.js";
+import { applyWhatsappRemoteLogout } from "./src/applyWhatsappRemoteLogout.js";
 
 applyWhatsappPairingHardening();
 applyWhatsappPairingHelloAck();
 applyWhatsappPairingUx();
 applyWhatsappPairingFeedback();
+applyWhatsappRemoteLogout();
 
 const [{ createApp }, { PORT, SUPABASE_CONFIGURED }, { restoreSessions }] =
   await Promise.all([
