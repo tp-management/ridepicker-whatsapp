@@ -5,7 +5,6 @@ import { Boom } from "@hapi/boom";
 
 import makeWASocket, {
   DisconnectReason,
-  fetchLatestWaWebVersion,
   useMultiFileAuthState,
 } from "@whiskeysockets/baileys";
 
@@ -189,6 +188,36 @@ async function waitForRegisteredSession(session, socket) {
   }
 
   return Boolean(session?.registered && socket?.user?.id);
+}
+
+function pairingCodeIsFresh(session) {
+  if (!session?.pairingCode || !session?.pairingCodeIssuedAt) {
+    return false;
+  }
+
+  const issuedAt = new Date(session.pairingCodeIssuedAt).getTime();
+  return (
+    Number.isFinite(issuedAt) &&
+    Date.now() - issuedAt < PAIRING_CODE_DISPLAY_TTL
+  );
+}
+
+function resetFailedPairingSession(sessionId) {
+  const existing = sessions.get(sessionId);
+
+  if (existing) {
+    clearReconnectTimer(existing);
+
+    try {
+      existing.socket?.end?.(new Error("Resetting failed pairing session"));
+    } catch {
+      // Socket may already be closed.
+    }
+
+    sessions.delete(sessionId);
+  }
+
+  removeAuthDirectory(sessionId);
 }
 
 function disconnectDetails(lastDisconnect) {
@@ -684,29 +713,9 @@ export async function startSession(
 
   sessions.set(id, session);
 
-  // Keep the socket configuration intentionally small.
-  // We only add the current WhatsApp Web version because stale WA Web versions
-  // can generate a pairing code that the phone later refuses to accept.
-  let waVersion = null;
-
-  try {
-    const latest = await fetchLatestWaWebVersion({});
-    waVersion = latest?.version || null;
-
-    if (waVersion) {
-      console.log(
-        `[${id}] WhatsApp Web version: ${waVersion.join(".")}`
-      );
-    }
-  } catch (error) {
-    console.warn(
-      `[${id}] could not fetch latest WhatsApp Web version; using Baileys default:`,
-      error.message
-    );
-  }
-
+  // Keep the socket configuration intentionally small and use Baileys defaults.
+  // This is the previously stable RidePicker socket configuration.
   const socket = makeWASocket({
-    ...(waVersion ? { version: waVersion } : {}),
     auth: state,
     markOnlineOnConnect: false,
     printQRInTerminal: false,
@@ -734,7 +743,10 @@ export async function startSession(
   socket.ev.on("connection.update", async (update) => {
     const { connection, qr, lastDisconnect } = update;
 
-    if (connection === "connecting" || qr) {
+    // Pairing-code auth must wait for the first QR challenge. This mirrors
+    // the official Baileys example and avoids asking for a phone code while
+    // the socket is only in the generic `connecting` phase.
+    if (qr && !session.registered) {
       resolvePairingReady(session);
     }
 
@@ -864,50 +876,12 @@ export async function startSession(
         message,
       };
 
-      if (statusCode === DisconnectReason.loggedOut) {
-        clearReconnectTimer(session);
-        session.status = "LOGGED_OUT";
-        session.qr = null;
-        session.pairingCode = null;
-        session.pairingCodeIssuedAt = null;
-        session.pairingPhone = null;
-        session.pairingAttemptActive = false;
-
-        console.log(`[${id}] WhatsApp logged out`);
-        logWhatsappEvent(
-          session,
-          "info",
-          "whatsapp_logged_out",
-          "WhatsApp logged out",
-          { statusCode }
-        );
-
-        await persistSessionState(session, {
-          status: "LOGGED_OUT",
-          bot_mode: "off",
-          whatsapp_phone: null,
-          display_name: null,
-          connected_at: null,
-        });
-
-        await addSessionActivity(session, "WhatsApp disconnected", "");
-
-        await forwardSessionEvent({
-          event: "session.logged_out",
-          session: id,
-          userId: session.userId,
-          timestamp: Date.now(),
-        });
-
-        return;
-      }
-
       const restartRequired =
         statusCode === DisconnectReason.restartRequired;
 
-      // Baileys intentionally closes the socket after a successful pairing
-      // handshake with restartRequired. We MUST recreate the socket with the
-      // newly saved credentials instead of treating 515 as a failed pairing.
+      // A 515/restartRequired is part of the normal Baileys pairing flow after
+      // credentials have been accepted. Recreate the socket with the saved
+      // credentials instead of treating it as a failed pairing.
       if (restartRequired) {
         session.status = "RECONNECTING";
 
@@ -955,16 +929,16 @@ export async function startSession(
         return;
       }
 
-      // If this was still an unregistered pairing attempt, do not enter an
-      // endless reconnect loop. The code was rejected/expired or the upstream
-      // pairing handshake failed. Frontend should request a fresh code.
+      // During an unregistered pairing attempt, a close is a pairing failure,
+      // not a real user logout. Keep the last code in memory for the display
+      // TTL so polling cannot make it vanish while the user is typing. Do not
+      // destroy partial auth asynchronously here. The NEXT explicit request
+      // for a new code resets failed auth before creating a fresh socket.
       if (!session.registered && session.pairingAttemptActive) {
         clearReconnectTimer(session);
         session.status = "ERROR";
-        session.pairingCode = null;
-        session.pairingCodeIssuedAt = null;
-        session.pairingPhone = null;
         session.pairingAttemptActive = false;
+        session.pairingRequestInFlight = false;
 
         console.error(
           `[${id}] pairing failed before credentials were registered`,
@@ -975,11 +949,55 @@ export async function startSession(
           "error",
           "pairing_failed",
           message,
-          { statusCode, registered: session.registered }
+          {
+            statusCode,
+            registered: session.registered,
+            authReset: false,
+            codePreservedForDisplay: Boolean(session.pairingCode),
+          }
         );
 
         await persistSessionState(session, {
           status: "ERROR",
+        });
+
+        return;
+      }
+
+      // Only a non-pairing 401 is a genuine WhatsApp logout.
+      if (statusCode === DisconnectReason.loggedOut) {
+        clearReconnectTimer(session);
+        session.status = "LOGGED_OUT";
+        session.qr = null;
+        session.pairingCode = null;
+        session.pairingCodeIssuedAt = null;
+        session.pairingPhone = null;
+        session.pairingAttemptActive = false;
+
+        console.log(`[${id}] WhatsApp logged out`);
+        logWhatsappEvent(
+          session,
+          "info",
+          "whatsapp_logged_out",
+          "WhatsApp logged out",
+          { statusCode }
+        );
+
+        await persistSessionState(session, {
+          status: "LOGGED_OUT",
+          bot_mode: "off",
+          whatsapp_phone: null,
+          display_name: null,
+          connected_at: null,
+        });
+
+        await addSessionActivity(session, "WhatsApp disconnected", "");
+
+        await forwardSessionEvent({
+          event: "session.logged_out",
+          session: id,
+          userId: session.userId,
+          timestamp: Date.now(),
         });
 
         return;
@@ -1102,8 +1120,9 @@ export async function requestPairingCode({
 
   const digits = phoneDigits(phone);
 
-  // Baileys explicitly recommends waiting until the socket reaches
-  // connecting or emits a QR event before requestPairingCode().
+  // Wait for the QR challenge. The official Baileys example requests the
+  // phone pairing code from the QR update, which is a stronger readiness
+  // signal than the generic `connecting` state.
   await waitForPairingReady(session);
 
   if (session.registered) {
@@ -1142,6 +1161,9 @@ export async function requestPairingCode({
       "pairing_code_created",
       "WhatsApp pairing code created"
     );
+
+    // Return the pairing code immediately. The frontend should show it as soon
+    // as Baileys creates it while the connection lifecycle continues normally.
 
     await persistSessionState(session, {
       status: "STARTING",
@@ -1223,6 +1245,10 @@ export async function startManagedSession(
     }
   }
 
+  if (method === "pairing_code" && dbSession.status === "ERROR") {
+    resetFailedPairingSession(dbSession.id);
+  }
+
   const session = await startSession(dbSession.id, {
     userId,
   });
@@ -1273,9 +1299,47 @@ export async function requestManagedPairingCode(userId, phone = null) {
     throw error;
   }
 
-  const session = await startSession(dbSession.id, {
-    userId,
-  });
+  let memorySession = sessions.get(dbSession.id) || null;
+
+  // Repeated taps while the current attempt is healthy return the SAME fresh
+  // code. We never rotate a live code under the user's fingers.
+  if (
+    memorySession?.socket &&
+    memorySession.pairingAttemptActive &&
+    !memorySession.lastError &&
+    pairingCodeIsFresh(memorySession)
+  ) {
+    const latest = await repository.getWhatsappSessionByUser(userId);
+
+    return {
+      ...normalizeManagedSession(latest, memorySession),
+      pairingCode: {
+        code: memorySession.pairingCode,
+        issuedAt: memorySession.pairingCodeIssuedAt,
+        phone: memorySession.pairingPhone,
+      },
+    };
+  }
+
+  // If the previous attempt failed, clean its temporary auth only when the
+  // user explicitly requests a new code. This prevents the current code from
+  // disappearing due to an async connection-close event.
+  const failedAttempt =
+    dbSession.status === "ERROR" ||
+    (memorySession &&
+      !memorySession.registered &&
+      (memorySession.status === "ERROR" || memorySession.lastError));
+
+  if (failedAttempt) {
+    resetFailedPairingSession(dbSession.id);
+    memorySession = null;
+  }
+
+  const session =
+    memorySession ||
+    (await startSession(dbSession.id, {
+      userId,
+    }));
 
   const pairing = await requestPairingCode({
     sessionId: dbSession.id,
@@ -1413,8 +1477,12 @@ function normalizeManagedSession(dbSession, memorySession) {
   const status = memorySession?.status || dbSession?.status || "DISCONNECTED";
   const qrDataUrl = memorySession?.qr || null;
   const qrIssuedAt = memorySession?.qrIssuedAt || null;
-  const pairingCode = memorySession?.pairingCode || null;
-  const pairingIssuedAt = memorySession?.pairingCodeIssuedAt || null;
+  const pairingCode = pairingCodeIsFresh(memorySession)
+    ? memorySession.pairingCode
+    : null;
+  const pairingIssuedAt = pairingCode
+    ? memorySession?.pairingCodeIssuedAt || null
+    : null;
 
   return {
     sessionId: memorySession?.id || dbSession?.id || null,
