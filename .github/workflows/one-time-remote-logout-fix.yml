@@ -1,0 +1,107 @@
+name: One-time remote logout pairing fix
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Patch only WhatsApp remote logout lifecycle
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/whatsapp.js')
+          source = path.read_text()
+
+          old_logout = '''        await forwardSessionEvent({
+          event: "session.logged_out",
+          session: id,
+          userId: session.userId,
+          timestamp: Date.now(),
+        });
+
+        return;
+'''
+
+          new_logout = '''        await forwardSessionEvent({
+          event: "session.logged_out",
+          session: id,
+          userId: session.userId,
+          timestamp: Date.now(),
+        });
+
+        // Remote removal from WhatsApp Linked Devices permanently invalidates
+        // these credentials. Clear runtime and filesystem auth immediately so
+        // the next connection-code request cannot see stale registered=true.
+        session.registered = false;
+        dropSocketSession(session, {
+          removeAuth: true,
+          reason: "WhatsApp device was removed remotely",
+        });
+
+        return;
+'''
+
+          old_pairing = '''  let session = sessions.get(dbSession.id) || null;
+
+  if (session?.registered || dbSession.status === "CONNECTED") {
+'''
+
+          new_pairing = '''  let session = sessions.get(dbSession.id) || null;
+
+  // A terminal database state wins over stale Baileys memory/auth. This is the
+  // recovery path for a device removed directly from WhatsApp Linked Devices.
+  if (["LOGGED_OUT", "DISCONNECTED"].includes(dbSession.status)) {
+    stopManagedPairingFlow(dbSession.id);
+
+    if (session) {
+      session.registered = false;
+      dropSocketSession(session, {
+        removeAuth: true,
+        reason: "Discarding stale WhatsApp auth before fresh pairing",
+      });
+    } else {
+      removeAuthDirectory(dbSession.id);
+    }
+
+    session = null;
+  }
+
+  if (session?.registered || dbSession.status === "CONNECTED") {
+'''
+
+          if source.count(old_logout) != 1:
+              raise SystemExit(f'expected exactly one logout target, got {source.count(old_logout)}')
+          if source.count(old_pairing) != 1:
+              raise SystemExit(f'expected exactly one pairing target, got {source.count(old_pairing)}')
+
+          source = source.replace(old_logout, new_logout, 1)
+          source = source.replace(old_pairing, new_pairing, 1)
+          path.write_text(source)
+          PY
+
+      - name: Syntax check
+        run: npm run check
+
+      - name: Commit only final WhatsApp code
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/one-time-remote-logout-fix.yml
+          git rm .github/one-time-remote-logout-fix.trigger
+          git add src/whatsapp.js
+          git commit -m "fix: reset stale auth after remote WhatsApp logout"
+          git push origin HEAD:main
