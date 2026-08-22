@@ -21,6 +21,12 @@ export function patchCallOrderFromIndex(source) {
 
 export async function materializeCurrentPatchedWhatsapp({
   repoRoot = process.cwd(),
+  baseWhatsappPath = path.join(
+    repoRoot,
+    "test",
+    "fixtures",
+    "whatsapp.pre-canonical.js"
+  ),
 } = {}) {
   const tempRoot = await fs.mkdtemp(
     path.join(os.tmpdir(), "ridepicker-whatsapp-patched-")
@@ -28,10 +34,7 @@ export async function materializeCurrentPatchedWhatsapp({
   const tempSrc = path.join(tempRoot, "src");
   await fs.mkdir(tempSrc, { recursive: true });
 
-  await fs.copyFile(
-    path.join(repoRoot, "src", "whatsapp.js"),
-    path.join(tempSrc, "whatsapp.js")
-  );
+  await fs.copyFile(baseWhatsappPath, path.join(tempSrc, "whatsapp.js"));
 
   for (const [fileName] of PATCH_CHAIN) {
     await fs.copyFile(
