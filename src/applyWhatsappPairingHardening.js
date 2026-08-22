@@ -64,6 +64,34 @@ export function applyWhatsappPairingHardening() {
 
   source = replaceExactlyOnce(
     source,
+    `    if (!wasRegistered && session.registered) {\n      console.log(\`[\${id}] WhatsApp credentials registered\`);\n      logWhatsappEvent(\n        session,\n        "info",\n        "credentials_registered",\n        "WhatsApp credentials registered"\n      );\n    }`,
+    `    if (!wasRegistered && session.registered) {\n      const pairingFlow = managedPairingFlows.get(id) || null;\n\n      // The phone has consumed the pairing code. From this moment the code is\n      // no longer useful to the user, even though the socket may still need a\n      // 515 restart before reaching connection=open. Hide it immediately and\n      // cancel the wall-clock rotation timer. If Baileys later reports 408,\n      // that transport event is the authoritative expiry signal and a fresh\n      // code is generated immediately.\n      if (pairingFlow?.active) {\n        if (pairingFlow.rotateTimer) {\n          clearTimeout(pairingFlow.rotateTimer);\n          pairingFlow.rotateTimer = null;\n        }\n        pairingFlow.published = false;\n        pairingFlow.code = null;\n        pairingFlow.codeRotatesAt = null;\n\n        session.pairingCode = null;\n        session.pairingCodeIssuedAt = null;\n\n        logWhatsappEvent(\n          session,\n          "info",\n          "pairing_code_consumed",\n          "WhatsApp pairing code was consumed by the phone"\n        );\n      }\n\n      console.log(\`[\${id}] WhatsApp credentials registered\`);\n      logWhatsappEvent(\n        session,\n        "info",\n        "credentials_registered",\n        "WhatsApp credentials registered"\n      );\n    }`,
+    "hide consumed pairing code"
+  );
+
+  source = replaceExactlyOnce(
+    source,
+    `  const naturalExpiry =\n    statusCode === DisconnectReason.timedOut &&\n    codeAgeMs >= MANAGED_PAIRING_NATURAL_EXPIRY_MIN_AGE_MS;`,
+    `  // Baileys' 408/timedOut event is the source of truth for pairing-code\n  // expiry. Do not infer validity from RidePicker's display countdown because\n  // WhatsApp can retire the underlying refs earlier than our nominal timer.\n  const naturalExpiry =\n    statusCode === DisconnectReason.timedOut;`,
+    "Baileys authoritative expiry"
+  );
+
+  source = replaceExactlyOnce(
+    source,
+    `  const delay = naturalExpiry\n    ? 1_000\n    : managedPairingRetryDelay(flow.failureCount);\n\n  void writeSystemLog({`,
+    `  const delay = naturalExpiry\n    ? 0\n    : managedPairingRetryDelay(flow.failureCount);\n\n  void writeSystemLog({`,
+    "zero-delay expiry retry"
+  );
+
+  source = replaceExactlyOnce(
+    source,
+    `  flow.retryTimer = setTimeout(() => {\n    flow.retryTimer = null;\n\n    if (!flow.active) return;\n\n    void ensureManagedPairingAttempt(flow, {\n      reason: naturalExpiry ? 'expired_code_retry' : 'auto_retry',\n      forceNewCode: true,\n    });\n  }, delay);`,
+    `  if (naturalExpiry) {\n    // Start the replacement attempt in the same lifecycle turn. Socket setup\n    // and WhatsApp's next QR challenge still take real network time, but there\n    // is no artificial RidePicker delay anymore.\n    void ensureManagedPairingAttempt(flow, {\n      reason: 'expired_code_retry',\n      forceNewCode: true,\n    });\n    return;\n  }\n\n  flow.retryTimer = setTimeout(() => {\n    flow.retryTimer = null;\n\n    if (!flow.active) return;\n\n    void ensureManagedPairingAttempt(flow, {\n      reason: 'auto_retry',\n      forceNewCode: true,\n    });\n  }, delay);`,
+    "immediate expired code replacement"
+  );
+
+  source = replaceExactlyOnce(
+    source,
     `    if (connection === "open") {\n      clearReconnectTimer(session);\n\n      const actuallyRegistered = await waitForRegisteredSession(`,
     `    if (connection === "open") {\n      clearReconnectTimer(session);\n      session.openedOnce = true;\n      session.passkeyRequired = false;\n\n      const actuallyRegistered = await waitForRegisteredSession(`,
     "connection open confirmation"
