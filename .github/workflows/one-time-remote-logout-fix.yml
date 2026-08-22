@@ -2,29 +2,26 @@ name: One-time remote logout pairing fix
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   patch:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - name: Patch only WhatsApp remote logout lifecycle
+      - name: Patch WhatsApp remote logout lifecycle
         run: |
-          python3 - <<'PY'
+          python - <<'PY'
           from pathlib import Path
 
-          path = Path('src/whatsapp.js')
-          source = path.read_text()
+          p = Path("src/whatsapp.js")
+          s = p.read_text()
 
           old_logout = '''        await forwardSessionEvent({
           event: "session.logged_out",
@@ -35,7 +32,6 @@ jobs:
 
         return;
 '''
-
           new_logout = '''        await forwardSessionEvent({
           event: "session.logged_out",
           session: id,
@@ -59,11 +55,10 @@ jobs:
 
   if (session?.registered || dbSession.status === "CONNECTED") {
 '''
-
           new_pairing = '''  let session = sessions.get(dbSession.id) || null;
 
-  // A terminal database state wins over stale Baileys memory/auth. This is the
-  // recovery path for a device removed directly from WhatsApp Linked Devices.
+  // Terminal DB state wins over stale Baileys memory/auth after a device is
+  // removed directly from WhatsApp Linked Devices.
   if (["LOGGED_OUT", "DISCONNECTED"].includes(dbSession.status)) {
     stopManagedPairingFlow(dbSession.id);
 
@@ -83,20 +78,20 @@ jobs:
   if (session?.registered || dbSession.status === "CONNECTED") {
 '''
 
-          if source.count(old_logout) != 1:
-              raise SystemExit(f'expected exactly one logout target, got {source.count(old_logout)}')
-          if source.count(old_pairing) != 1:
-              raise SystemExit(f'expected exactly one pairing target, got {source.count(old_pairing)}')
+          if s.count(old_logout) != 1:
+              raise SystemExit("logout target mismatch")
+          if s.count(old_pairing) != 1:
+              raise SystemExit("pairing target mismatch")
 
-          source = source.replace(old_logout, new_logout, 1)
-          source = source.replace(old_pairing, new_pairing, 1)
-          path.write_text(source)
+          s = s.replace(old_logout, new_logout, 1)
+          s = s.replace(old_pairing, new_pairing, 1)
+          p.write_text(s)
           PY
 
-      - name: Syntax check
+      - name: Check syntax
         run: npm run check
 
-      - name: Commit only final WhatsApp code
+      - name: Commit fix and remove temporary runner
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
