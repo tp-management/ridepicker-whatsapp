@@ -1,0 +1,265 @@
+name: One-time WhatsApp pairing hardening
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Patch only WhatsApp pairing lifecycle
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/whatsapp.js')
+          source = path.read_text()
+
+          replacements = []
+
+          replacements.append((
+'''import makeWASocket, {
+  DisconnectReason,
+  useMultiFileAuthState,
+} from "@whiskeysockets/baileys";''',
+'''import makeWASocket, {
+  Browsers,
+  DisconnectReason,
+  fetchLatestWaWebVersion,
+  useMultiFileAuthState,
+} from "@whiskeysockets/baileys";'''))
+
+          replacements.append((
+'''const PAIRING_READY_TIMEOUT_MS = 15 * 1000;
+const REGISTRATION_CONFIRM_TIMEOUT_MS = 5 * 1000;''',
+'''const PAIRING_READY_TIMEOUT_MS = 15 * 1000;
+const REGISTRATION_CONFIRM_TIMEOUT_MS = 5 * 1000;
+const WA_WEB_VERSION_CACHE_MS = 10 * 60 * 1000;
+
+let cachedWaWebVersion = null;
+let cachedWaWebVersionExpiresAt = 0;
+
+async function resolveWaWebVersion() {
+  if (
+    cachedWaWebVersion &&
+    Date.now() < cachedWaWebVersionExpiresAt
+  ) {
+    return cachedWaWebVersion;
+  }
+
+  try {
+    const result = await fetchLatestWaWebVersion({});
+    const version = Array.isArray(result?.version)
+      ? result.version
+      : null;
+
+    if (version?.length === 3) {
+      cachedWaWebVersion = version;
+      cachedWaWebVersionExpiresAt =
+        Date.now() + WA_WEB_VERSION_CACHE_MS;
+      console.log(
+        `[whatsapp] using WA Web version ${version.join(".")}`
+      );
+      return version;
+    }
+  } catch (error) {
+    console.warn(
+      "[whatsapp] could not fetch current WA Web version:",
+      error.message
+    );
+  }
+
+  return null;
+}'''))
+
+          replacements.append((
+'''    registered: Boolean(state?.creds?.registered),
+    reconnectTimer: null,
+    lastError: null,
+    disposed: false,''',
+'''    registered: Boolean(state?.creds?.registered),
+    openedOnce: false,
+    passkeyRequired: false,
+    reconnectTimer: null,
+    lastError: null,
+    disposed: false,'''))
+
+          replacements.append((
+'''  // Keep the socket configuration intentionally small and use Baileys defaults.
+  // This is the previously stable RidePicker socket configuration.
+  const socket = makeWASocket({
+    auth: state,
+    markOnlineOnConnect: false,
+    printQRInTerminal: false,
+  });''',
+'''  // Keep the socket configuration intentionally small, but do not rely on
+  // Baileys' bundled WA Web version for a fresh device link. WhatsApp can
+  // reject new-device pairing when that version falls behind the live web
+  // client while existing sessions continue to work.
+  const waWebVersion = await resolveWaWebVersion();
+  const socket = makeWASocket({
+    auth: state,
+    ...(waWebVersion ? { version: waWebVersion } : {}),
+    browser: Browsers.macOS("Chrome"),
+    markOnlineOnConnect: false,
+    printQRInTerminal: false,
+  });'''))
+
+          replacements.append((
+'''  session.socket = socket;
+
+  socket.ev.on("creds.update", async () => {''',
+'''  session.socket = socket;
+
+  // Some WhatsApp accounts are now put through an additional passkey
+  // companion-linking step after link-code companion_finish. rc14 ACKs that
+  // notification but cannot complete WebAuthn headlessly, which otherwise
+  // looks like a successful credentials update followed by a silent 408.
+  // Detect it explicitly so we never persist a fake connected state or reuse
+  // half-completed auth on reconnect. Challenge contents are deliberately not
+  // logged.
+  socket.ws?.on?.("CB:notification", (node) => {
+    const notificationType = node?.attrs?.type || null;
+
+    if (
+      ![
+        "passkey_prologue_request",
+        "crsc_continuation",
+      ].includes(notificationType) ||
+      !isCurrentSession(session)
+    ) {
+      return;
+    }
+
+    const hasRequestOptions = Boolean(
+      Array.isArray(node?.content) &&
+        node.content.some(
+          (child) => child?.tag === "passkey_request_options"
+        )
+    );
+
+    session.passkeyRequired = true;
+    session.lastError = {
+      code: "PASSKEY_REQUIRED",
+      message:
+        "WhatsApp requires an additional passkey verification step for this account.",
+    };
+
+    logWhatsappEvent(
+      session,
+      "warning",
+      "pairing_passkey_required",
+      "WhatsApp requires passkey verification during device linking",
+      {
+        notificationType,
+        hasRequestOptions,
+      }
+    );
+
+    stopManagedPairingFlow(id, {
+      keepForError: true,
+    });
+
+    void persistSessionState(session, {
+      status: "ERROR",
+    });
+
+    // Allow Baileys' own notification handler a brief moment to ACK the stanza
+    // before discarding the unusable partial auth state.
+    setTimeout(() => {
+      if (!isCurrentSession(session) || !session.passkeyRequired) {
+        return;
+      }
+
+      session.registered = false;
+      dropSocketSession(session, {
+        removeAuth: true,
+        reason: "Passkey-required WhatsApp pairing cannot use partial auth",
+      });
+    }, 750);
+  });
+
+  socket.ev.on("creds.update", async () => {'''))
+
+          replacements.append((
+'''    if (connection === "open") {
+      clearReconnectTimer(session);
+
+      const actuallyRegistered = await waitForRegisteredSession(''',
+'''    if (connection === "open") {
+      clearReconnectTimer(session);
+      session.openedOnce = true;
+      session.passkeyRequired = false;
+
+      const actuallyRegistered = await waitForRegisteredSession(''''))
+
+          replacements.append((
+'''      const restartRequired =
+        statusCode === DisconnectReason.restartRequired;
+      const managedFlow = managedPairingFlows.get(id) || null;
+
+      // creds.update and connection.update are separate async event streams.''',
+'''      const restartRequired =
+        statusCode === DisconnectReason.restartRequired;
+      const managedFlow = managedPairingFlows.get(id) || null;
+
+      // A pairing-code companion_finish can set creds.registered=true before
+      // the device has ever reached connection=open. If that half-completed
+      // first login then dies with 408/401/428, reusing those credentials is
+      // exactly what turns the next reconnect into the 401 loop seen in live
+      // testing. Treat it as a failed pairing, wipe partial auth, and let the
+      // existing bounded retry flow create a genuinely fresh code/session.
+      const failedBeforeFirstOpen =
+        managedFlow?.active &&
+        !session.openedOnce &&
+        [
+          DisconnectReason.timedOut,
+          DisconnectReason.loggedOut,
+          DisconnectReason.connectionClosed,
+        ].includes(statusCode);
+
+      if (failedBeforeFirstOpen) {
+        session.registered = false;
+
+        await handleManagedPairingFailure(managedFlow, session, {
+          statusCode,
+          message,
+          phase: "post_registration_pre_open",
+        });
+
+        return;
+      }
+
+      // creds.update and connection.update are separate async event streams.'''))
+
+          for old, new in replacements:
+            count = source.count(old)
+            if count != 1:
+              raise SystemExit(f'expected exactly one target, got {count}: {old[:90]!r}')
+            source = source.replace(old, new, 1)
+
+          path.write_text(source)
+          PY
+
+      - name: Syntax check
+        run: node --check src/whatsapp.js
+
+      - name: Commit final WhatsApp fix only
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/one-time-pairing-hardening.yml
+          git add src/whatsapp.js
+          git commit -m "fix: harden WhatsApp first-login pairing"
+          git push origin HEAD:main
