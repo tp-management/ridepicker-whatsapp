@@ -161,6 +161,45 @@ test("two concurrent pairing triggers issue exactly one companion request", asyn
   assert.equal(totalQueryCalls(harness.baileys), 1);
 });
 
+test("HelloAck without pairing ref fails without publishing code or setting creds.me", async (t) => {
+  const harness = await useHarness(t);
+  const userId = "hello-ack-missing-ref";
+
+  harness.baileys.__setQueryHandler(async () => ({
+    tag: "iq",
+    attrs: {},
+    content: [
+      {
+        tag: "link_code_companion_reg",
+        attrs: {},
+        content: [],
+      },
+    ],
+  }));
+
+  await assert.rejects(
+    harness.whatsapp.requestManagedPairingCode(userId, PHONE),
+    (error) =>
+      error?.message ===
+      "WhatsApp did not return a pairing reference for the new code."
+  );
+
+  const sessionId = `session-${userId}`;
+  const flow = harness.whatsapp.__characterization.managedPairingFlows.get(sessionId);
+  const socket = harness.baileys.__getSockets()[0];
+
+  assert.ok(flow, "expected failed pairing flow to remain observable");
+  assert.equal(flow.published, false);
+  assert.equal(flow.code, null);
+  assert.equal(
+    harness.whatsapp.__characterization.sessions.get(sessionId)?.pairingCode || null,
+    null
+  );
+  assert.equal(socket.authState.creds.pairingCode, undefined);
+  assert.equal(socket.authState.creds.me, null);
+  assert.equal(totalQueryCalls(harness.baileys), 1);
+});
+
 test("registered pairing followed by 515 enters lifecycle restart path", async (t) => {
   const harness = await useHarness(t);
   const { session } = await startManagedPairing(harness, "restart-515");
