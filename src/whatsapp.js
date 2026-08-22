@@ -1,11 +1,19 @@
 import fs from "fs";
 import path from "path";
+import { randomBytes } from "crypto";
 import QRCode from "qrcode";
 import { Boom } from "@hapi/boom";
 
 import makeWASocket, {
   DisconnectReason,
+  fetchLatestWaWebVersion,
   useMultiFileAuthState,
+  aesEncryptCTR,
+  bytesToCrockford,
+  derivePairingCodeKey,
+  getBinaryNodeChild,
+  jidEncode,
+  S_WHATSAPP_NET,
 } from "@whiskeysockets/baileys";
 
 import {
@@ -19,6 +27,7 @@ import {
 } from "./config.js";
 import { repository } from "./repository.js";
 import { writeSystemLog } from "./systemLog.js";
+import { createBaileysRawLogger } from "./baileysRawLogger.js";
 import { isSupabaseConfigured } from "./supabase.js";
 import {
   isoFromWhatsappTimestamp,
@@ -30,6 +39,7 @@ fs.mkdirSync(DATA_DIR, {
   recursive: true,
 });
 
+const BAILEYS_RAW_LOGGING_V1 = true;
 const sessions = new Map();
 const managedPairingFlows = new Map();
 const groupNameCache = new Map();
@@ -66,6 +76,52 @@ const LEGACY_PAIRING_CODE_DISPLAY_TTL = 3 * 60 * 1000;
 
 const PAIRING_READY_TIMEOUT_MS = 15 * 1000;
 const REGISTRATION_CONFIRM_TIMEOUT_MS = 5 * 1000;
+const WA_REMOTE_LOGOUT_V2 = true;
+const WA_PAIRING_HARDENING_V1 = true;
+const WA_PAIRING_QUERY_ACK_V2 = true;
+const WA_PAIRING_UX_V1 = true;
+const WA_PAIRING_FEEDBACK_V1 = true;
+const BAILEYS_RAW_UI_ERRORS_V1 = true;
+const PAIRING_RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
+const WA_WEB_VERSION_CACHE_MS = 10 * 60 * 1000;
+
+let cachedWaWebVersion = null;
+let cachedWaWebVersionExpiresAt = 0;
+
+async function resolveWaWebVersion() {
+  if (
+    cachedWaWebVersion &&
+    Date.now() < cachedWaWebVersionExpiresAt
+  ) {
+    return cachedWaWebVersion;
+  }
+
+  try {
+    const result = await fetchLatestWaWebVersion({
+      signal: AbortSignal.timeout(5_000),
+    });
+    const version = Array.isArray(result?.version)
+      ? result.version
+      : null;
+
+    if (version?.length === 3) {
+      cachedWaWebVersion = version;
+      cachedWaWebVersionExpiresAt =
+        Date.now() + WA_WEB_VERSION_CACHE_MS;
+      console.log(
+        `[whatsapp] using WA Web version ${version.join(".")}`
+      );
+      return version;
+    }
+  } catch (error) {
+    console.warn(
+      "[whatsapp] could not fetch current WA Web version:",
+      error.message
+    );
+  }
+
+  return null;
+}
 
 const TRACKABLE_MESSAGE_TYPES = new Set([
   "text",
@@ -200,6 +256,147 @@ function waitForPairingReady(session) {
   });
 }
 
+async function requestVerifiedPairingCode(
+  session,
+  socket,
+  phoneDigits
+) {
+  const authState = socket?.authState;
+
+  if (!authState?.creds || !socket?.query) {
+    const error = new Error("WhatsApp pairing transport is not ready");
+    error.status = 409;
+    throw error;
+  }
+
+  const pairingCode = bytesToCrockford(randomBytes(5));
+  authState.creds.pairingCode = pairingCode;
+
+  const jid = jidEncode(phoneDigits, "s.whatsapp.net");
+  const salt = randomBytes(32);
+  const randomIv = randomBytes(16);
+  const key = await derivePairingCodeKey(pairingCode, salt);
+  const ciphered = aesEncryptCTR(
+    authState.creds.pairingEphemeralKeyPair.public,
+    key,
+    randomIv
+  );
+  const wrappedEphemeralKey = Buffer.concat([salt, randomIv, ciphered]);
+
+  try {
+    // Mirror the upstream pairing fix: use query() so this promise is tied to
+    // the actual companion_hello IQ response instead of returning an optimistic
+    // local code before WhatsApp has accepted it.
+    const result = await socket.query(
+      {
+        tag: "iq",
+        attrs: {
+          to: S_WHATSAPP_NET,
+          type: "set",
+          xmlns: "md",
+        },
+        content: [
+          {
+            tag: "link_code_companion_reg",
+            attrs: {
+              jid,
+              stage: "companion_hello",
+              should_show_push_notification: "true",
+            },
+            content: [
+              {
+                tag: "link_code_pairing_wrapped_companion_ephemeral_pub",
+                attrs: {},
+                content: wrappedEphemeralKey,
+              },
+              {
+                tag: "companion_server_auth_key_pub",
+                attrs: {},
+                content: authState.creds.noiseKey.public,
+              },
+              {
+                tag: "companion_platform_id",
+                attrs: {},
+                content: "1",
+              },
+              {
+                tag: "companion_platform_display",
+                attrs: {},
+                content: "Chrome (Mac OS)",
+              },
+              {
+                tag: "link_code_pairing_nonce",
+                attrs: {},
+                content: "0",
+              },
+            ],
+          },
+        ],
+      },
+      15_000
+    );
+
+    if (!result) {
+      const error = new Error(
+        "WhatsApp timed out while registering the pairing code."
+      );
+      error.status = 504;
+      throw error;
+    }
+
+    const registrationNode = getBinaryNodeChild(
+      result,
+      "link_code_companion_reg"
+    );
+    const pairingRefNode = registrationNode
+      ? getBinaryNodeChild(registrationNode, "link_code_pairing_ref")
+      : null;
+
+    if (!pairingRefNode) {
+      const error = new Error(
+        "WhatsApp did not return a pairing reference for the new code."
+      );
+      error.status = 502;
+      throw error;
+    }
+
+    // Persist through the normal creds.update listener. This keeps the auth
+    // writer scoped inside startSession instead of leaking local variables into
+    // the managed pairing function.
+    authState.creds.me = { id: jid, name: "~" };
+    socket.ev.emit("creds.update", authState.creds);
+
+    logWhatsappEvent(
+      session,
+      "info",
+      "pairing_hello_accepted",
+      "WhatsApp accepted pairing code registration",
+      { hasPairingRef: true }
+    );
+
+    return pairingCode;
+  } catch (error) {
+    if (authState.creds.pairingCode === pairingCode) {
+      authState.creds.pairingCode = undefined;
+    }
+
+    logWhatsappEvent(
+      session,
+      "warning",
+      "pairing_hello_rejected",
+      error.message,
+      {
+        statusCode:
+          error?.output?.statusCode ||
+          error?.statusCode ||
+          null,
+      }
+    );
+
+    throw error;
+  }
+}
+
 async function waitForRegisteredSession(session, socket) {
   const startedAt = Date.now();
 
@@ -322,6 +519,8 @@ function ensureManagedPairingFlow({ sessionId, userId, phone }) {
       published: false,
       lastError: null,
       lastFailureAt: null,
+      retryAt: null,
+      notice: null,
     };
 
     managedPairingFlows.set(sessionId, flow);
@@ -330,6 +529,26 @@ function ensureManagedPairingFlow({ sessionId, userId, phone }) {
 
   const phoneChanged = flow.phoneDigits !== digits;
   const restartingAfterTerminalError = !flow.active;
+  const rateLimitUntilMs = flow.rateLimitUntil
+    ? new Date(flow.rateLimitUntil).getTime()
+    : 0;
+
+  if (!phoneChanged && rateLimitUntilMs > Date.now()) {
+    const error = new Error(
+      flow.lastError?.message || "rate-overlimit"
+    );
+    error.status = 429;
+    error.details = { retryAt: flow.rateLimitUntil };
+    throw error;
+  }
+
+  if (flow.rateLimitUntil && rateLimitUntilMs <= Date.now()) {
+    flow.rateLimitUntil = null;
+  }
+
+  if (phoneChanged) {
+    flow.rateLimitUntil = null;
+  }
 
   if (phoneChanged || restartingAfterTerminalError) {
     clearManagedPairingTimers(flow);
@@ -339,6 +558,8 @@ function ensureManagedPairingFlow({ sessionId, userId, phone }) {
     flow.failureCount = 0;
     flow.lastError = null;
     flow.lastFailureAt = null;
+    flow.retryAt = null;
+    flow.notice = null;
   }
 
   flow.userId = userId;
@@ -463,8 +684,12 @@ async function handleManagedPairingFailure(
     ? Date.now() - new Date(flow.codeIssuedAt).getTime()
     : 0;
 
+  // Baileys' 408/timedOut event is the source of truth for pairing-code
+  // expiry. Do not infer validity from RidePicker's display countdown because
+  // WhatsApp can retire the underlying refs earlier than our nominal timer.
   const naturalExpiry =
     statusCode === DisconnectReason.timedOut &&
+    flow.published &&
     codeAgeMs >= MANAGED_PAIRING_NATURAL_EXPIRY_MIN_AGE_MS;
 
   clearManagedPairingTimers(flow);
@@ -483,9 +708,59 @@ async function handleManagedPairingFailure(
     flow.failureCount += 1;
   }
 
+  const rateLimited =
+    statusCode === 429 ||
+    /rate[-_\s]?overlimit|rate[-_\s]?limit/i.test(String(message || ""));
+
+  if (rateLimited) {
+    flow.rateLimitUntil = new Date(
+      Date.now() + PAIRING_RATE_LIMIT_COOLDOWN_MS
+    ).toISOString();
+    flow.lastError = {
+      code: "RATE_LIMITED",
+      message: String(message || "rate-overlimit"),
+      upstreamStatusCode: statusCode ?? null,
+    };
+  }
+
   const canAutoRetry =
     naturalExpiry ||
-    flow.failureCount <= MANAGED_PAIRING_MAX_AUTOMATIC_RETRIES;
+    (!rateLimited &&
+      flow.failureCount <= MANAGED_PAIRING_MAX_AUTOMATIC_RETRIES);
+
+  // Keep a frontend-safe notification in the same in-memory pairing flow.
+  // Rate limiting is terminal for the current attempt because retrying it
+  // immediately only extends the server-side throttle.
+  if (rateLimited) {
+    flow.notice = {
+      id: `pairing_rate_limited_${flow.lastFailureAt}`,
+      type: "error",
+      title: flow.lastError.message,
+      message: flow.lastError.message,
+      failureCount: flow.failureCount,
+      retrying: false,
+      retryAt: flow.rateLimitUntil,
+    };
+  } else if (!naturalExpiry) {
+    const firstFailure = flow.failureCount === 1;
+    flow.notice = {
+      id: `pairing_failure_${flow.lastFailureAt}`,
+      type: canAutoRetry ? "warning" : "error",
+      title: canAutoRetry
+        ? firstFailure
+          ? "Connection code needs another try"
+          : "Still trying to create your connection code"
+        : "Could not create a connection code",
+      message: canAutoRetry
+        ? firstFailure
+          ? "The first attempt did not complete. RidePicker is retrying automatically."
+          : "WhatsApp did not complete the last attempt. RidePicker is retrying automatically."
+        : "Automatic retries stopped. Tap Generate connection code to try again.",
+      failureCount: flow.failureCount,
+      retrying: canAutoRetry,
+      retryAt: null,
+    };
+  }
 
   if (session) {
     session.pairingAttemptActive = false;
@@ -557,8 +832,13 @@ async function handleManagedPairingFailure(
   }
 
   const delay = naturalExpiry
-    ? 1_000
+    ? 0
     : managedPairingRetryDelay(flow.failureCount);
+
+  flow.retryAt = new Date(Date.now() + delay).toISOString();
+  if (flow.notice?.retrying) {
+    flow.notice.retryAt = flow.retryAt;
+  }
 
   void writeSystemLog({
     userId: flow.userId,
@@ -574,13 +854,26 @@ async function handleManagedPairingFailure(
     },
   });
 
+  if (naturalExpiry) {
+    // Start the replacement attempt in the same lifecycle turn. Socket setup
+    // and WhatsApp's next QR challenge still take real network time, but there
+    // is no artificial RidePicker delay anymore.
+    flow.retryAt = null;
+    void ensureManagedPairingAttempt(flow, {
+      reason: 'expired_code_retry',
+      forceNewCode: true,
+    });
+    return;
+  }
+
   flow.retryTimer = setTimeout(() => {
     flow.retryTimer = null;
+    flow.retryAt = null;
 
     if (!flow.active) return;
 
     void ensureManagedPairingAttempt(flow, {
-      reason: naturalExpiry ? 'expired_code_retry' : 'auto_retry',
+      reason: 'auto_retry',
       forceNewCode: true,
     });
   }, delay);
@@ -590,7 +883,7 @@ async function ensureManagedPairingAttempt(
   flow,
   { reason = 'initial', forceNewCode = false } = {}
 ) {
-  if (!flow?.active || flow.requestInFlight || flow.retryTimer) {
+  if (!flow?.active || flow.retryTimer) {
     return null;
   }
 
@@ -603,24 +896,37 @@ async function ensureManagedPairingAttempt(
     };
   }
 
-  let session = sessions.get(flow.sessionId);
-
-  if (!isCurrentSession(session) || !session.socket) {
-    session = await startSession(flow.sessionId, {
-      userId: flow.userId,
-    });
-  }
-
-  if (session.registered) {
-    stopManagedPairingFlow(flow.sessionId);
+  if (flow.requestInFlight) {
     return null;
   }
 
   flow.requestInFlight = true;
   const attemptToken = ++flow.attemptToken;
-  const socket = session.socket;
+  let session = null;
 
   try {
+    session = sessions.get(flow.sessionId);
+
+    if (!isCurrentSession(session) || !session.socket) {
+      session = await startSession(flow.sessionId, {
+        userId: flow.userId,
+      });
+    }
+
+    if (
+      !flow.active ||
+      attemptToken !== flow.attemptToken ||
+      !isCurrentSession(session)
+    ) {
+      return null;
+    }
+
+    if (session.registered) {
+      stopManagedPairingFlow(flow.sessionId);
+      return null;
+    }
+
+    const socket = session.socket;
     await waitForPairingReady(session);
 
     if (
@@ -664,13 +970,11 @@ async function ensureManagedPairingAttempt(
       }
     );
 
-    const candidateCode = await socket.requestPairingCode(
+    const candidateCode = await requestVerifiedPairingCode(
+      session,
+      socket,
       flow.phoneDigits
     );
-
-    // Do NOT publish the candidate immediately. Baileys currently returns the
-    // code before WhatsApp has necessarily accepted companion_hello.
-    await sleep(MANAGED_PAIRING_PUBLISH_GRACE_MS);
 
     if (
       !flow.active ||
@@ -692,6 +996,22 @@ async function ensureManagedPairingAttempt(
     ).toISOString();
     flow.published = true;
     flow.lastError = null;
+    flow.retryAt = null;
+
+    if (flow.failureCount > 0) {
+      flow.notice = {
+        id: `pairing_recovered_${flow.codeIssuedAt}`,
+        type: "success",
+        title: "Connection code ready",
+        message:
+          flow.failureCount === 1
+            ? "The first attempt did not complete, but RidePicker created a fresh code automatically."
+            : `RidePicker created a fresh code automatically after ${flow.failureCount} failed attempts.`,
+        failureCount: flow.failureCount,
+        retrying: false,
+        retryAt: null,
+      };
+    }
 
     session.pairingCode = candidateCode;
     session.pairingCodeIssuedAt = flow.codeIssuedAt;
@@ -1234,6 +1554,8 @@ export async function startSession(
     pairingAttemptActive: false,
     status: "STARTING",
     registered: Boolean(state?.creds?.registered),
+    openedOnce: false,
+    passkeyRequired: false,
     reconnectTimer: null,
     lastError: null,
     disposed: false,
@@ -1241,15 +1563,93 @@ export async function startSession(
 
   sessions.set(id, session);
 
-  // Keep the socket configuration intentionally small and use Baileys defaults.
-  // This is the previously stable RidePicker socket configuration.
+  // Use the current WhatsApp Web version for fresh device linking when it
+  // can be resolved. Existing Baileys defaults remain the safe fallback.
+  const waWebVersion = await resolveWaWebVersion();
   const socket = makeWASocket({
     auth: state,
+    ...(waWebVersion ? { version: waWebVersion } : {}),
+    logger: createBaileysRawLogger({
+      userId,
+      sessionId: id,
+    }),
     markOnlineOnConnect: false,
     printQRInTerminal: false,
   });
 
   session.socket = socket;
+
+  // WhatsApp can require an additional passkey/WebAuthn step for selected
+  // accounts after pairing-code companion_finish. Baileys rc14 otherwise ACKs
+  // that notification without completing it, leaving the user waiting until a
+  // misleading 408. Detect the requirement immediately and discard partial
+  // credentials instead of pretending the device is registered.
+  socket.ws?.on?.("CB:notification", (node) => {
+    const notificationType = node?.attrs?.type || null;
+
+    if (
+      ![
+        "passkey_prologue_request",
+        "crsc_continuation",
+      ].includes(notificationType) ||
+      !isCurrentSession(session)
+    ) {
+      return;
+    }
+
+    const hasRequestOptions = Boolean(
+      Array.isArray(node?.content) &&
+        node.content.some(
+          (child) => child?.tag === "passkey_request_options"
+        )
+    );
+    const pairingFlow = managedPairingFlows.get(id) || null;
+
+    session.passkeyRequired = true;
+    session.lastError = {
+      code: "PASSKEY_REQUIRED",
+      message:
+        "WhatsApp requires an additional passkey verification step for this account.",
+    };
+
+    if (pairingFlow) {
+      pairingFlow.lastError = session.lastError;
+    }
+
+    logWhatsappEvent(
+      session,
+      "warning",
+      "pairing_passkey_required",
+      "WhatsApp requires passkey verification during device linking",
+      {
+        notificationType,
+        hasRequestOptions,
+      }
+    );
+
+    stopManagedPairingFlow(id, {
+      keepForError: true,
+    });
+
+    void persistSessionState(session, {
+      status: "ERROR",
+    });
+
+    // Give Baileys' own notification listener time to ACK the stanza before
+    // dropping the unusable partial auth state. No challenge contents are
+    // logged or persisted by RidePicker.
+    setTimeout(() => {
+      if (!isCurrentSession(session) || !session.passkeyRequired) {
+        return;
+      }
+
+      session.registered = false;
+      dropSocketSession(session, {
+        removeAuth: true,
+        reason: "Passkey-required WhatsApp pairing cannot use partial auth",
+      });
+    }, 750);
+  });
 
   socket.ev.on("creds.update", async () => {
     if (!isCurrentSession(session)) return;
@@ -1260,6 +1660,34 @@ export async function startSession(
     session.registered = Boolean(state?.creds?.registered);
 
     if (!wasRegistered && session.registered) {
+      const pairingFlow = managedPairingFlows.get(id) || null;
+
+      // The phone has consumed the pairing code. From this moment the code is
+      // no longer useful to the user, even though the socket may still need a
+      // 515 restart before reaching connection=open. Hide it immediately and
+      // cancel the wall-clock rotation timer. If Baileys later reports 408,
+      // that transport event is the authoritative expiry signal and a fresh
+      // code is generated immediately.
+      if (pairingFlow?.active) {
+        if (pairingFlow.rotateTimer) {
+          clearTimeout(pairingFlow.rotateTimer);
+          pairingFlow.rotateTimer = null;
+        }
+        pairingFlow.published = false;
+        pairingFlow.code = null;
+        pairingFlow.codeRotatesAt = null;
+
+        session.pairingCode = null;
+        session.pairingCodeIssuedAt = null;
+
+        logWhatsappEvent(
+          session,
+          "info",
+          "pairing_code_consumed",
+          "WhatsApp pairing code was consumed by the phone"
+        );
+      }
+
       console.log(`[${id}] WhatsApp credentials registered`);
       logWhatsappEvent(
         session,
@@ -1318,6 +1746,8 @@ export async function startSession(
 
     if (connection === "open") {
       clearReconnectTimer(session);
+      session.openedOnce = true;
+      session.passkeyRequired = false;
 
       const actuallyRegistered = await waitForRegisteredSession(
         session,
@@ -1435,6 +1865,31 @@ export async function startSession(
       const restartRequired =
         statusCode === DisconnectReason.restartRequired;
       const managedFlow = managedPairingFlows.get(id) || null;
+
+      // companion_finish can set creds.registered=true before the newly linked
+      // device has ever reached connection=open. A 408/401/428 at this point is
+      // still a failed pairing, not a healthy registered session that should be
+      // reconnected with half-completed credentials.
+      const failedBeforeFirstOpen =
+        managedFlow?.active &&
+        !session.openedOnce &&
+        [
+          DisconnectReason.timedOut,
+          DisconnectReason.loggedOut,
+          DisconnectReason.connectionClosed,
+        ].includes(statusCode);
+
+      if (failedBeforeFirstOpen) {
+        session.registered = false;
+
+        await handleManagedPairingFailure(managedFlow, session, {
+          statusCode,
+          message,
+          phase: "post_registration_pre_open",
+        });
+
+        return;
+      }
 
       // creds.update and connection.update are separate async event streams.
       // Give a 515 a very short grace period so a legitimate pair-success can
@@ -1866,6 +2321,28 @@ export async function refreshManagedSession(userId) {
   return getManagedSession(userId);
 }
 
+async function waitForManagedPairingOutcome(flow, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (managedPairingCodeIsVisible(flow)) {
+      return "code_ready";
+    }
+
+    if (flow?.lastError) {
+      return "error";
+    }
+
+    if (!flow?.active && !flow?.requestInFlight) {
+      return "stopped";
+    }
+
+    await sleep(75);
+  }
+
+  return "timeout";
+}
+
 export async function requestManagedPairingCode(userId, phone = null) {
   if (!isSupabaseConfigured()) {
     const error = new Error("Supabase is not configured");
@@ -1961,8 +2438,31 @@ export async function requestManagedPairingCode(userId, phone = null) {
     });
   }
 
+  // Keep the POST open just long enough to know whether the first attempt
+  // produced a real code or failed. Existing frontend error handling can then
+  // show a toast immediately instead of leaving the user staring at a spinner.
+  const firstOutcome = await waitForManagedPairingOutcome(flow);
   const latest = await repository.getWhatsappSessionByUser(userId);
-  return normalizeManagedSession(latest, sessions.get(dbSession.id) || session);
+  const normalized = normalizeManagedSession(
+    latest,
+    sessions.get(dbSession.id) || session
+  );
+
+  if (!normalized?.pairingCode && firstOutcome === "error" && flow.lastError) {
+    const error = new Error(
+      flow.lastError.message || "Unknown Baileys error"
+    );
+    error.status =
+      flow.lastError.code === "RATE_LIMITED" ? 429 : 503;
+    error.details = {
+      code: flow.lastError.code || null,
+      retrying: Boolean(flow.active && (flow.retryTimer || flow.requestInFlight)),
+      retryAt: flow.notice?.retryAt || flow.retryAt || null,
+    };
+    throw error;
+  }
+
+  return normalized;
 }
 
 export async function refreshManagedQr(userId) {
@@ -2021,13 +2521,44 @@ export async function retryManagedSession(userId) {
   return normalizeManagedSession(latest, session);
 }
 
-export async function disconnectSession(sessionId) {
+export async function disconnectSession(
+  sessionId,
+  { requestRemoteLogout = false } = {}
+) {
   stopManagedPairingFlow(sessionId);
 
   const session = sessions.get(sessionId);
 
   if (session) {
     clearReconnectTimer(session);
+
+    if (requestRemoteLogout) {
+      if (!session.socket || typeof session.socket.logout !== "function") {
+        const error = new Error(
+          "Active WhatsApp socket is unavailable for logout."
+        );
+        error.status = 409;
+        throw error;
+      }
+
+      try {
+        // Match Baileys' own logout semantics exactly. Baileys sends
+        // remove-companion-device with sendNode() and then ends the socket.
+        // This confirms that the stanza was written to the transport, not that
+        // WhatsApp returned an IQ acknowledgement. Do not claim remote ACK.
+        await session.socket.logout();
+      } catch (error) {
+        console.warn(`[${sessionId}] logout failed:`, error.message);
+        if (!error.status) {
+          error.status = 502;
+        }
+        throw error;
+      }
+
+      sessions.delete(sessionId);
+      removeAuthDirectory(sessionId);
+      return;
+    }
 
     try {
       if (session.socket) {
@@ -2050,7 +2581,9 @@ export async function disconnectManagedSession(userId) {
     return null;
   }
 
-  await disconnectSession(dbSession.id);
+  await disconnectSession(dbSession.id, {
+    requestRemoteLogout: ["CONNECTED", "RECONNECTING"].includes(dbSession.status),
+  });
 
   const updated = await repository.updateWhatsappSessionById(
     dbSession.id,
@@ -2177,6 +2710,25 @@ let status =
       : null,
     error:
       managedFlow?.lastError || memorySession?.lastError || null,
+    pairingProgress: managedFlow
+      ? {
+          phase: pairingCode
+            ? "code_ready"
+            : managedFlow.active
+            ? managedFlow.retryAt
+              ? "retry_wait"
+              : managedFlow.requestInFlight
+              ? "generating"
+              : "starting"
+            : managedFlow.lastError
+            ? "failed"
+            : "idle",
+          attempt: Math.max(1, (managedFlow.failureCount || 0) + 1),
+          failureCount: managedFlow.failureCount || 0,
+          retryAt: managedFlow.retryAt || null,
+        }
+      : null,
+    pairingNotice: managedFlow?.notice || null,
   };
 }
 
