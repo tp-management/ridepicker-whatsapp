@@ -1,6 +1,13 @@
-import { createApp } from "./src/app.js";
-import { PORT, SUPABASE_CONFIGURED } from "./src/config.js";
-import { restoreSessions } from "./src/whatsapp.js";
+import { applyWhatsappPairingHardening } from "./src/applyWhatsappPairingHardening.js";
+
+applyWhatsappPairingHardening();
+
+const [{ createApp }, { PORT, SUPABASE_CONFIGURED }, { restoreSessions }] =
+  await Promise.all([
+    import("./src/app.js"),
+    import("./src/config.js"),
+    import("./src/whatsapp.js"),
+  ]);
 
 const app = createApp();
 
