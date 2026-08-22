@@ -1,0 +1,66 @@
+name: Apply WhatsApp remote logout cleanup
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch remote logout runtime cleanup
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path("src/whatsapp.js")
+          s = p.read_text()
+          old = '''        await forwardSessionEvent({
+          event: "session.logged_out",
+          session: id,
+          userId: session.userId,
+          timestamp: Date.now(),
+        });
+
+        return;
+      }
+'''
+          new = '''        await forwardSessionEvent({
+          event: "session.logged_out",
+          session: id,
+          userId: session.userId,
+          timestamp: Date.now(),
+        });
+
+        // A remote Linked Device removal is terminal. Drop the stale runtime
+        // session and its auth state so the next pairing starts completely fresh.
+        dropSocketSession(session, {
+          removeAuth: true,
+          reason: "WhatsApp device was removed remotely",
+        });
+
+        return;
+      }
+'''
+
+          if old not in s:
+              raise SystemExit("Expected remote logout block was not found; no change made.")
+
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/whatsapp.js
+          git diff --cached --quiet && exit 0
+          git commit -m "fix: fully clean up remote WhatsApp logout session"
+          git push origin HEAD:main
