@@ -10,6 +10,9 @@ on:
       - "package-lock.json"
       - ".github/workflows/whatsapp-refactor-tests.yml"
 
+permissions:
+  contents: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -36,3 +39,97 @@ jobs:
           name: materialized-whatsapp
           path: materialized-whatsapp.js
           if-no-files-found: error
+
+  generate-canonicalization:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refactor/whatsapp-modular
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Materialize canonical WhatsApp source
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from "node:fs/promises";
+          import { materializeCurrentPatchedWhatsapp } from "./test/helpers/materializePatchedWhatsapp.js";
+          const materialized = await materializeCurrentPatchedWhatsapp();
+          await fs.writeFile("src/whatsapp.js", materialized.source, "utf8");
+          await materialized.cleanup();
+          NODE
+      - name: Disable runtime source patching
+        run: |
+          cat > index.js <<'EOF'
+          const [{ createApp }, { PORT, SUPABASE_CONFIGURED }, { restoreSessions }] =
+            await Promise.all([
+              import("./src/app.js"),
+              import("./src/config.js"),
+              import("./src/whatsapp.js"),
+            ]);
+
+          const app = createApp();
+
+          app.listen(PORT, async () => {
+            console.log(`RidePicker backend running on port ${PORT}`);
+            console.log(
+              `Supabase: ${SUPABASE_CONFIGURED ? "configured" : "not configured"}`
+            );
+
+            try {
+              await restoreSessions();
+            } catch (error) {
+              console.error("Failed to restore sessions:", error);
+            }
+          });
+          EOF
+      - name: Add byte equality gate
+        run: |
+          cat > test/whatsappPatchBoundary.test.js <<'EOF'
+          import test from "node:test";
+          import assert from "node:assert/strict";
+          import fs from "node:fs/promises";
+          import path from "node:path";
+
+          import { materializeCurrentPatchedWhatsapp } from "./helpers/materializePatchedWhatsapp.js";
+
+          test("canonical whatsapp.js is byte-for-byte identical to materialized final patched source", async (t) => {
+            const materialized = await materializeCurrentPatchedWhatsapp();
+            t.after(materialized.cleanup);
+
+            const canonical = await fs.readFile(
+              path.join(process.cwd(), "src", "whatsapp.js")
+            );
+            const expected = Buffer.from(materialized.source, "utf8");
+
+            assert.equal(
+              canonical.equals(expected),
+              true,
+              "src/whatsapp.js must exactly equal the FINAL legacy patch-chain output"
+            );
+          });
+
+          test("index.js no longer imports or executes runtime WhatsApp source patches", async () => {
+            const indexSource = await fs.readFile(
+              path.join(process.cwd(), "index.js"),
+              "utf8"
+            );
+
+            assert.doesNotMatch(indexSource, /apply(?:Whatsapp|Baileys)\w+/);
+            assert.match(indexSource, /import\("\.\/src\/whatsapp\.js"\)/);
+          });
+          EOF
+      - run: npm ci
+      - run: npm test
+      - run: npm run check
+      - name: Create canonicalization commit
+        run: |
+          git config user.name "TravelsPlatform"
+          git config user.email "152078198+tp-management@users.noreply.github.com"
+          git add src/whatsapp.js index.js test/whatsappPatchBoundary.test.js
+          git diff --cached --check
+          git commit -m "refactor: canonicalize patched WhatsApp source"
+          git push --force origin HEAD:refs/heads/generated/whatsapp-canonicalization
