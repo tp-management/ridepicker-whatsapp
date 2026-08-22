@@ -95,11 +95,6 @@ function sanitize(value, depth = 0) {
 function normalizeSource(source) {
   const value = safeString(source || "backend", 100);
 
-  // Historical WhatsApp lifecycle logs are emitted by RidePicker code, even
-  // when their message/status fields contain values observed from Baileys or
-  // WhatsApp. Never label those wrapper events as if WhatsApp itself created
-  // the log row. Callers that persist an actual raw upstream record must opt
-  // in explicitly with source="whatsapp_raw" or source="baileys_raw".
   if (value === "whatsapp") {
     return "ridepicker_whatsapp";
   }
@@ -126,25 +121,15 @@ function withProvenance(source, details) {
     return { ...sanitized, provenance: "baileys_raw" };
   }
 
-  if (source === "ridepicker_whatsapp") {
-    return { ...sanitized, provenance: "ridepicker_emitted" };
-  }
-
   return sanitized;
 }
 
 /**
  * Best-effort persistent system logging.
  *
- * Important: this function never throws. A logging failure must never break
- * WhatsApp pairing, reconnects, n8n delivery, or an API request.
- *
- * Provenance rule:
- * - ridepicker_whatsapp = lifecycle/interpretation event emitted by RidePicker
- * - whatsapp_raw = exact upstream WhatsApp payload/value explicitly captured
- * - baileys_raw = exact Baileys payload/value explicitly captured
- *
- * Never store a RidePicker-authored sentence under whatsapp_raw/baileys_raw.
+ * WhatsApp diagnostics in Supabase must come from the native Baileys logger.
+ * RidePicker-authored WhatsApp lifecycle sentences are intentionally not
+ * persisted here. Other application sources such as n8n/backend remain valid.
  */
 export async function writeSystemLog({
   userId = null,
@@ -163,6 +148,10 @@ export async function writeSystemLog({
     ? level
     : "info";
   const normalizedSource = normalizeSource(source);
+
+  if (normalizedSource === "ridepicker_whatsapp") {
+    return null;
+  }
 
   try {
     const rows = await insertRows("system_logs", [
