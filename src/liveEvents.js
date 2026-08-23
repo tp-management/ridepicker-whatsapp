@@ -4,7 +4,10 @@ import { repository } from "./repository.js";
 import { isSupabaseConfigured } from "./supabase.js";
 
 const subscribers = new Map();
+const pending = new Map();
+const sessionOwners = new Map();
 let sequence = 0;
+let repositoryHooksInstalled = false;
 
 function normalizeScopes(scopes) {
   const values = Array.isArray(scopes) ? scopes : [scopes];
@@ -16,6 +19,44 @@ function normalizeScopes(scopes) {
     ),
   ];
   return normalized.length ? normalized : ["all"];
+}
+
+function cacheSessionOwner(row) {
+  if (row?.id && row?.user_id) {
+    sessionOwners.set(String(row.id), String(row.user_id));
+  }
+  return row;
+}
+
+function deliverPending(userId) {
+  const key = String(userId || "");
+  const queued = pending.get(key);
+  if (!queued) return null;
+  pending.delete(key);
+
+  const listeners = subscribers.get(key);
+  if (!listeners?.size) return null;
+
+  const event = {
+    id: ++sequence,
+    type: "invalidate",
+    scopes: [...queued.scopes],
+    reason:
+      queued.reasons.size === 1
+        ? [...queued.reasons][0]
+        : "batched_change",
+    at: new Date().toISOString(),
+  };
+
+  for (const listener of [...listeners]) {
+    try {
+      listener(event);
+    } catch {
+      // One dead client must not break delivery to other clients.
+    }
+  }
+
+  return event;
 }
 
 export function subscribeUserChanges(userId, listener) {
@@ -41,26 +82,104 @@ export function publishUserChange(
   reason = "data_changed"
 ) {
   const key = String(userId || "");
-  const listeners = subscribers.get(key);
-  if (!key || !listeners?.size) return null;
+  if (!key) return false;
 
-  const event = {
-    id: ++sequence,
-    type: "invalidate",
-    scopes: normalizeScopes(scopes),
-    reason: String(reason || "data_changed"),
-    at: new Date().toISOString(),
-  };
-
-  for (const listener of [...listeners]) {
-    try {
-      listener(event);
-    } catch {
-      // One dead client must not break delivery to other clients.
-    }
+  let queued = pending.get(key);
+  if (!queued) {
+    queued = {
+      scopes: new Set(),
+      reasons: new Set(),
+      timer: null,
+    };
+    pending.set(key, queued);
   }
 
-  return event;
+  for (const scope of normalizeScopes(scopes)) queued.scopes.add(scope);
+  queued.reasons.add(String(reason || "data_changed"));
+
+  if (!queued.timer) {
+    queued.timer = setTimeout(() => deliverPending(key), 30);
+    queued.timer.unref?.();
+  }
+
+  return true;
+}
+
+export function installRepositoryLiveEvents() {
+  if (repositoryHooksInstalled) return;
+  repositoryHooksInstalled = true;
+
+  const originalGetByUser = repository.getWhatsappSessionByUser.bind(repository);
+  repository.getWhatsappSessionByUser = async (...args) =>
+    cacheSessionOwner(await originalGetByUser(...args));
+
+  const originalGetById = repository.getWhatsappSessionById.bind(repository);
+  repository.getWhatsappSessionById = async (...args) =>
+    cacheSessionOwner(await originalGetById(...args));
+
+  const originalListSessions = repository.listWhatsappSessions.bind(repository);
+  repository.listWhatsappSessions = async (...args) => {
+    const rows = await originalListSessions(...args);
+    for (const row of rows || []) cacheSessionOwner(row);
+    return rows;
+  };
+
+  const originalEnsureSession = repository.ensureWhatsappSession.bind(repository);
+  repository.ensureWhatsappSession = async (...args) =>
+    cacheSessionOwner(await originalEnsureSession(...args));
+
+  const originalUpdateById = repository.updateWhatsappSessionById.bind(repository);
+  repository.updateWhatsappSessionById = async (sessionId, patch, ...rest) => {
+    const row = cacheSessionOwner(
+      await originalUpdateById(sessionId, patch, ...rest)
+    );
+    const userId = row?.user_id || sessionOwners.get(String(sessionId));
+    if (userId) {
+      const scopes = ["whatsapp"];
+      if (patch?.bot_mode !== undefined || patch?.bot_enabled_at !== undefined) {
+        scopes.push("ridepicker");
+      }
+      publishUserChange(userId, scopes, "whatsapp_state");
+    }
+    return row;
+  };
+
+  const originalUpdateByUser = repository.updateWhatsappSessionByUser.bind(repository);
+  repository.updateWhatsappSessionByUser = async (userId, patch, ...rest) => {
+    const row = cacheSessionOwner(
+      await originalUpdateByUser(userId, patch, ...rest)
+    );
+    const scopes = ["whatsapp"];
+    if (patch?.bot_mode !== undefined || patch?.bot_enabled_at !== undefined) {
+      scopes.push("ridepicker");
+    }
+    publishUserChange(userId, scopes, "whatsapp_state");
+    return row;
+  };
+
+  const originalAddActivity = repository.addActivity.bind(repository);
+  repository.addActivity = async (userId, entry, ...rest) => {
+    const result = await originalAddActivity(userId, entry, ...rest);
+    publishUserChange(userId, ["activity"], "activity_write");
+    return result;
+  };
+
+  const originalInsertMessage = repository.insertMessage.bind(repository);
+  repository.insertMessage = async (input, ...rest) => {
+    const result = await originalInsertMessage(input, ...rest);
+    if (!result) return result;
+
+    const sessionId = input?.session_id;
+    let userId = sessionOwners.get(String(sessionId || ""));
+    if (!userId && sessionId) {
+      const row = await repository.getWhatsappSessionById(sessionId);
+      userId = row?.user_id || null;
+    }
+    if (userId) {
+      publishUserChange(userId, ["messages", "activity"], "message_write");
+    }
+    return result;
+  };
 }
 
 export function scopesForUserWrite(path = "") {
