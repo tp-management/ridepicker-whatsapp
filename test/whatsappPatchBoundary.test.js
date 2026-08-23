@@ -1,24 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
 import { materializeCurrentPatchedWhatsapp } from "./helpers/materializePatchedWhatsapp.js";
 
-test("canonical whatsapp.js is byte-for-byte identical to materialized final patched source", async (t) => {
+const CANONICALIZATION_PROOF_SHA256 =
+  "e639e4806d2e7ff291f8ddccf2246e06922d176ebe095a31a377e1099ef05480";
+
+test("archived patch chain still reproduces the canonicalization proof source", async (t) => {
   const materialized = await materializeCurrentPatchedWhatsapp();
   t.after(materialized.cleanup);
 
-  const canonical = await fs.readFile(
-    path.join(process.cwd(), "src", "whatsapp.js")
-  );
-  const expected = Buffer.from(materialized.source, "utf8");
+  const digest = createHash("sha256")
+    .update(materialized.source, "utf8")
+    .digest("hex");
 
-  assert.equal(
-    canonical.equals(expected),
-    true,
-    "src/whatsapp.js must exactly equal the FINAL legacy patch-chain output"
-  );
+  assert.equal(digest, CANONICALIZATION_PROOF_SHA256);
 });
 
 test("index.js no longer imports or executes runtime WhatsApp source patches", async () => {
