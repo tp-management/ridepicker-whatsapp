@@ -2,7 +2,7 @@ import express from "express";
 
 import { sanitizeAssistKeywords } from "./assistPreferences.js";
 import { repository } from "./repository.js";
-import { isSupabaseConfigured } from "./supabase.js";
+import { insertRows, isSupabaseConfigured } from "./supabase.js";
 
 const router = express.Router();
 
@@ -44,6 +44,25 @@ function toApi(row) {
   };
 }
 
+async function ensureDriverPreferences(userId) {
+  const existing = await repository.getDriverPreferences(userId);
+  if (existing) return existing;
+
+  // Older RidePicker users can pre-date driver_preferences. Create the default
+  // row lazily and make the insert race-safe so concurrent GET/PUT requests do
+  // not turn a harmless missing row into a 404 or unique-key failure.
+  const created = await insertRows(
+    "driver_preferences",
+    [{ user_id: userId }],
+    {
+      query: { on_conflict: "user_id" },
+      prefer: "resolution=ignore-duplicates,return=representation",
+    }
+  );
+
+  return created?.[0] || repository.getDriverPreferences(userId);
+}
+
 const userRoute = [requireSupabase, requireUser];
 
 router.get(
@@ -51,9 +70,9 @@ router.get(
   ...userRoute,
   async (req, res) => {
     try {
-      const row = await repository.getDriverPreferences(req.params.userId);
+      const row = await ensureDriverPreferences(req.params.userId);
       if (!row) {
-        return res.status(404).json({ error: "driver preferences not found" });
+        throw new Error("Could not initialize driver preferences");
       }
       res.setHeader("Cache-Control", "no-store");
       res.json({ assistPreferences: toApi(row) });
@@ -75,13 +94,15 @@ router.put(
         });
       }
 
+      await ensureDriverPreferences(req.params.userId);
+
       const keywords = sanitizeAssistKeywords(req.body?.keywords);
       const row = await repository.updateDriverPreferences(req.params.userId, {
         assist_keywords: keywords,
       });
 
       if (!row) {
-        return res.status(404).json({ error: "driver preferences not found" });
+        throw new Error("Could not update driver preferences");
       }
 
       res.json({ assistPreferences: toApi(row) });
