@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { createManagedSessionBoundary } from "../src/whatsapp/managedSessionBoundary.js";
 
-function createHarness(status) {
+function createHarness({ status, hasRuntime = false, hasAuth = false }) {
   const calls = [];
   const dbSession = status
     ? { id: "session-user-1", user_id: "user-1", status }
@@ -19,77 +19,77 @@ function createHarness(status) {
     async disconnectSession(sessionId, options) {
       calls.push(["disconnect", sessionId, options]);
     },
-    async getManagedSession(userId) {
-      calls.push(["getManaged", userId]);
-      return { status: status === "CONNECTED" ? "connected" : "disconnected" };
+    getSession(sessionId) {
+      calls.push(["getRuntime", sessionId]);
+      return hasRuntime ? { id: sessionId, registered: true } : null;
     },
-    async requestManagedPairingCode(userId, phone) {
-      calls.push(["pair", userId, phone]);
-      return { pairingCode: { code: "ABCDEFGH" } };
-    },
-    async startManagedSession(userId, options) {
-      calls.push(["start", userId, options]);
-      return { status: "starting" };
+    async hasSupabaseAuthState(sessionId) {
+      calls.push(["hasAuth", sessionId]);
+      return hasAuth;
     },
   });
 
   return { boundary, calls };
 }
 
-test("DISCONNECTED is fully cleaned before a new pairing code request", async () => {
-  const { boundary, calls } = createHarness("DISCONNECTED");
-
-  const result = await boundary.requestFreshManagedPairingCode(
-    "user-1",
-    "+37061234567"
-  );
-
-  assert.equal(result.pairingCode.code, "ABCDEFGH");
-  assert.deepEqual(calls, [
-    ["getDb", "user-1"],
-    ["disconnect", "session-user-1", { requestRemoteLogout: false }],
-    ["pair", "user-1", "+37061234567"],
-  ]);
-});
-
-test("LOGGED_OUT is fully cleaned before returning frontend state", async () => {
-  const { boundary, calls } = createHarness("LOGGED_OUT");
-
-  await boundary.getReconciledManagedSession("user-1");
-
-  assert.deepEqual(calls, [
-    ["getDb", "user-1"],
-    ["disconnect", "session-user-1", { requestRemoteLogout: false }],
-    ["getManaged", "user-1"],
-  ]);
-});
-
-test("terminal state is fully cleaned before any managed start", async () => {
-  const { boundary, calls } = createHarness("DISCONNECTED");
-
-  await boundary.startFreshManagedSession("user-1", {
-    method: "pairing_code",
-    phone: "+37061234567",
+test("DISCONNECTED with stale registered runtime is fully cleaned", async () => {
+  const { boundary, calls } = createHarness({
+    status: "DISCONNECTED",
+    hasRuntime: true,
+    hasAuth: true,
   });
 
+  await boundary.reconcileTerminalSession("user-1");
+
   assert.deepEqual(calls, [
     ["getDb", "user-1"],
+    ["getRuntime", "session-user-1"],
+    ["hasAuth", "session-user-1"],
     ["disconnect", "session-user-1", { requestRemoteLogout: false }],
-    [
-      "start",
-      "user-1",
-      { method: "pairing_code", phone: "+37061234567" },
-    ],
   ]);
 });
 
-test("CONNECTED state is not torn down", async () => {
-  const { boundary, calls } = createHarness("CONNECTED");
+test("LOGGED_OUT with only stale Supabase auth is fully cleaned", async () => {
+  const { boundary, calls } = createHarness({
+    status: "LOGGED_OUT",
+    hasRuntime: false,
+    hasAuth: true,
+  });
 
-  await boundary.requestFreshManagedPairingCode("user-1", "+37061234567");
+  await boundary.reconcileTerminalSession("user-1");
 
   assert.deepEqual(calls, [
     ["getDb", "user-1"],
-    ["pair", "user-1", "+37061234567"],
+    ["getRuntime", "session-user-1"],
+    ["hasAuth", "session-user-1"],
+    ["disconnect", "session-user-1", { requestRemoteLogout: false }],
   ]);
+});
+
+test("already-clean terminal state does not repeat auth cleanup on every poll", async () => {
+  const { boundary, calls } = createHarness({
+    status: "DISCONNECTED",
+    hasRuntime: false,
+    hasAuth: false,
+  });
+
+  await boundary.reconcileTerminalSession("user-1");
+
+  assert.deepEqual(calls, [
+    ["getDb", "user-1"],
+    ["getRuntime", "session-user-1"],
+    ["hasAuth", "session-user-1"],
+  ]);
+});
+
+test("CONNECTED state is never torn down by the reconciliation boundary", async () => {
+  const { boundary, calls } = createHarness({
+    status: "CONNECTED",
+    hasRuntime: true,
+    hasAuth: true,
+  });
+
+  await boundary.reconcileTerminalSession("user-1");
+
+  assert.deepEqual(calls, [["getDb", "user-1"]]);
 });
