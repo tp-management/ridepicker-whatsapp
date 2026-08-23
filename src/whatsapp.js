@@ -27,7 +27,7 @@ import {
 } from "./config.js";
 import { repository } from "./repository.js";
 import { writeSystemLog } from "./systemLog.js";
-import { createBaileysRawLogger } from "./baileysRawLogger.js";
+import { createBaileysRawLogger } from "./whatsapp/logging/baileysLogger.js";
 import { isSupabaseConfigured } from "./supabase.js";
 import {
   isoFromWhatsappTimestamp,
