@@ -8,6 +8,7 @@ on:
       - "test/**"
       - "package.json"
       - "package-lock.json"
+      - ".env.example"
       - ".gitignore"
       - "README.md"
       - ".github/workflows/whatsapp-refactor-tests.yml"
