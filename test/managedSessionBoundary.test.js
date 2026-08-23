@@ -12,13 +12,15 @@ function createHarness({
   hasAuth = true,
   authRegistered = true,
   logoutError = null,
+  startError = null,
 } = {}) {
   const calls = [];
+  let authExists = hasAuth;
   let dbSession = {
     id: "session-user-1",
     user_id: "user-1",
     status,
-    bot_mode: "off",
+    bot_mode: "assist",
     connected_at: connectedAt,
     whatsapp_phone: "+37061234567",
     display_name: "Test",
@@ -26,9 +28,7 @@ function createHarness({
 
   function makeRuntime() {
     const socket = {
-      user: runtimeRegistered
-        ? { id: "37061234567@s.whatsapp.net" }
-        : null,
+      user: runtimeRegistered ? { id: "37061234567@s.whatsapp.net" } : null,
       async logout() {
         calls.push(["logout"]);
         if (logoutError) throw logoutError;
@@ -68,8 +68,9 @@ function createHarness({
       },
     },
     async disconnectSession(sessionId, options) {
-      calls.push(["disconnect", sessionId, options]);
+      calls.push(["disconnectLocal", sessionId, options]);
       runtime = null;
+      authExists = false;
     },
     async getManagedSession(userId) {
       calls.push(["getManaged", userId]);
@@ -84,6 +85,7 @@ function createHarness({
     },
     async startSession(sessionId, { userId }) {
       calls.push(["start", sessionId, userId]);
+      if (startError) throw startError;
       runtime = makeRuntime();
       runtime.status = "CONNECTED";
       runtime.openedOnce = true;
@@ -95,15 +97,15 @@ function createHarness({
     },
     async hasSupabaseAuthState(sessionId) {
       calls.push(["hasAuth", sessionId]);
-      return hasAuth;
+      return authExists;
     },
     async loadSupabaseAuthState(sessionId) {
       calls.push(["loadAuth", sessionId]);
-      return {
-        state: {
-          creds: { registered: authRegistered },
-        },
-      };
+      return { state: { creds: { registered: authRegistered } } };
+    },
+    async clearSupabaseAuthState(sessionId) {
+      calls.push(["clearAuth", sessionId]);
+      authExists = false;
     },
     async writeSystemLog(entry) {
       calls.push(["log", entry.event, entry.details]);
@@ -124,32 +126,144 @@ function indexOfCall(calls, name) {
   return calls.findIndex((entry) => entry[0] === name);
 }
 
-test("DISCONNECTED registered residue remote-unlinks before durable/auth cleanup", async () => {
+test("DISCONNECTED + registered runtime repairs durable state and never logs out", async () => {
   const { boundary, calls, getDbSession } = createHarness({
     status: "DISCONNECTED",
+    connectedAt: null,
     hasRuntime: true,
     runtimeRegistered: true,
+    runtimeStatus: "CONNECTED",
     hasAuth: true,
     authRegistered: true,
   });
 
   await boundary.reconcileTerminalSession("user-1");
 
-  const logoutIndex = indexOfCall(calls, "logout");
-  const updateIndex = indexOfCall(calls, "updateDb");
-  const disconnectIndex = indexOfCall(calls, "disconnect");
+  assert.equal(getDbSession().status, "CONNECTED");
+  assert.ok(getDbSession().connected_at);
+  assert.equal(indexOfCall(calls, "logout"), -1);
+  assert.equal(indexOfCall(calls, "clearAuth"), -1);
+  assert.equal(indexOfCall(calls, "disconnectLocal"), -1);
+});
 
-  assert.ok(logoutIndex >= 0, "expected native socket.logout");
-  assert.ok(updateIndex > logoutIndex, "DB must become LOGGED_OUT after remote logout");
-  assert.ok(
-    disconnectIndex > updateIndex,
-    "runtime/auth cleanup must happen only after durable LOGGED_OUT"
+test("DISCONNECTED + registered Supabase auth rehydrates instead of unlinking", async () => {
+  const { boundary, calls } = createHarness({
+    status: "DISCONNECTED",
+    connectedAt: null,
+    hasRuntime: false,
+    hasAuth: true,
+    authRegistered: true,
+  });
+
+  await boundary.reconcileTerminalSession("user-1");
+
+  assert.ok(indexOfCall(calls, "start") >= 0);
+  assert.equal(indexOfCall(calls, "logout"), -1);
+  assert.equal(indexOfCall(calls, "clearAuth"), -1);
+  assert.equal(indexOfCall(calls, "disconnectLocal"), -1);
+});
+
+test("recovery failure blocks downstream action and preserves registered auth", async () => {
+  const { boundary, calls } = createHarness({
+    status: "DISCONNECTED",
+    connectedAt: null,
+    hasRuntime: false,
+    hasAuth: true,
+    authRegistered: true,
+    startError: new Error("cannot build socket"),
+  });
+
+  await assert.rejects(
+    boundary.reconcileTerminalSession("user-1"),
+    (error) => error?.status === 503 && error?.details?.code === "WHATSAPP_RECOVERY_FAILED"
   );
+
+  assert.equal(indexOfCall(calls, "logout"), -1);
+  assert.equal(indexOfCall(calls, "clearAuth"), -1);
+  assert.equal(indexOfCall(calls, "disconnectLocal"), -1);
+});
+
+test("previously linked DISCONNECTED row with unusable creds fails closed", async () => {
+  const { boundary, calls, getDbSession } = createHarness({
+    status: "DISCONNECTED",
+    connectedAt: "2026-08-23T14:09:02.368Z",
+    hasRuntime: false,
+    hasAuth: false,
+    authRegistered: false,
+  });
+
+  await assert.rejects(
+    boundary.reconcileTerminalSession("user-1"),
+    (error) => error?.status === 409 && error?.details?.code === "WHATSAPP_CREDENTIALS_UNAVAILABLE"
+  );
+
+  assert.equal(getDbSession().status, "ERROR");
+  assert.equal(getDbSession().bot_mode, "off");
+  assert.equal(indexOfCall(calls, "logout"), -1);
+  assert.equal(indexOfCall(calls, "clearAuth"), -1);
+});
+
+test("unregistered never-connected pairing residue is local-only cleanup", async () => {
+  const { boundary, calls } = createHarness({
+    status: "DISCONNECTED",
+    connectedAt: null,
+    hasRuntime: true,
+    runtimeRegistered: false,
+    runtimeStatus: "STARTING",
+    hasAuth: true,
+    authRegistered: false,
+  });
+
+  await boundary.reconcileTerminalSession("user-1");
+
+  assert.equal(indexOfCall(calls, "logout"), -1);
+  assert.ok(indexOfCall(calls, "end") >= 0);
+  assert.ok(indexOfCall(calls, "disconnectLocal") >= 0);
+});
+
+test("LOGGED_OUT residue is cleaned locally without a second remote logout", async () => {
+  const { boundary, calls } = createHarness({
+    status: "LOGGED_OUT",
+    connectedAt: null,
+    hasRuntime: true,
+    hasAuth: true,
+    authRegistered: true,
+  });
+
+  await boundary.reconcileTerminalSession("user-1");
+
+  assert.equal(indexOfCall(calls, "logout"), -1);
+  assert.ok(indexOfCall(calls, "end") >= 0);
+  assert.ok(indexOfCall(calls, "disconnectLocal") >= 0);
+});
+
+test("CONNECTED state is untouched by reconciliation", async () => {
+  const { boundary, calls } = createHarness({ status: "CONNECTED" });
+
+  await boundary.reconcileTerminalSession("user-1");
+
+  assert.deepEqual(calls, [["getDb", "user-1"]]);
+});
+
+test("explicit disconnect performs native logout before LOGGED_OUT and cleanup", async () => {
+  const { boundary, calls, getDbSession } = createHarness({ status: "CONNECTED" });
+
+  await boundary.disconnectManagedSessionSafely("user-1");
+
+  const logout = indexOfCall(calls, "logout");
+  const update = calls.findIndex(
+    (call) => call[0] === "updateDb" && call[2]?.status === "LOGGED_OUT"
+  );
+  const cleanup = indexOfCall(calls, "disconnectLocal");
+
+  assert.ok(logout >= 0);
+  assert.ok(update > logout);
+  assert.ok(cleanup > update);
   assert.equal(getDbSession().status, "LOGGED_OUT");
   assert.equal(getDbSession().connected_at, null);
 });
 
-test("remote logout failure preserves auth and never claims local logout", async () => {
+test("remote logout failure preserves auth and durable linked state", async () => {
   const failure = new Error("transport unavailable");
   const { boundary, calls, getDbSession, getRuntime } = createHarness({
     status: "CONNECTED",
@@ -161,82 +275,35 @@ test("remote logout failure preserves auth and never claims local logout", async
     (error) => error?.status === 502 && error?.message === failure.message
   );
 
-  assert.equal(indexOfCall(calls, "disconnect"), -1);
   assert.equal(getDbSession().status, "CONNECTED");
   assert.equal(getDbSession().connected_at, "2026-08-23T14:09:02.368Z");
+  assert.equal(indexOfCall(calls, "clearAuth"), -1);
+  assert.equal(indexOfCall(calls, "disconnectLocal"), -1);
   assert.equal(getRuntime()?.socket, null);
-  assert.ok(indexOfCall(calls, "end") > indexOfCall(calls, "logout"));
   assert.ok(
     calls.some(
-      (entry) =>
-        entry[0] === "log" &&
-        entry[1] === "whatsapp_remote_logout_failed" &&
-        entry[2]?.authPreserved === true
+      (call) => call[0] === "log" && call[1] === "whatsapp_remote_logout_failed" && call[2]?.authPreserved
     )
   );
 });
 
-test("registered Supabase auth can rehydrate a socket before remote unlink", async () => {
+test("registered Supabase auth can rehydrate only for an explicit remote disconnect", async () => {
   const { boundary, calls, getDbSession } = createHarness({
     status: "DISCONNECTED",
+    connectedAt: null,
     hasRuntime: false,
     hasAuth: true,
     authRegistered: true,
   });
 
-  await boundary.reconcileTerminalSession("user-1");
+  await boundary.disconnectManagedSessionSafely("user-1");
 
-  const startIndex = indexOfCall(calls, "start");
-  const logoutIndex = indexOfCall(calls, "logout");
-  const disconnectIndex = indexOfCall(calls, "disconnect");
-
-  assert.ok(startIndex >= 0);
-  assert.ok(logoutIndex > startIndex);
-  assert.ok(disconnectIndex > logoutIndex);
+  assert.ok(indexOfCall(calls, "start") >= 0);
+  assert.ok(indexOfCall(calls, "logout") > indexOfCall(calls, "start"));
   assert.equal(getDbSession().status, "LOGGED_OUT");
 });
 
-test("LOGGED_OUT residue is local-cleaned without a second remote logout", async () => {
-  const { boundary, calls } = createHarness({
-    status: "LOGGED_OUT",
-    hasRuntime: false,
-    hasAuth: true,
-    authRegistered: true,
-    connectedAt: null,
-  });
-
-  await boundary.reconcileTerminalSession("user-1");
-
-  assert.equal(indexOfCall(calls, "logout"), -1);
-  assert.ok(indexOfCall(calls, "disconnect") >= 0);
-});
-
-test("unregistered partial pairing residue is safe to clear locally", async () => {
-  const { boundary, calls } = createHarness({
-    status: "DISCONNECTED",
-    connectedAt: null,
-    hasRuntime: false,
-    hasAuth: true,
-    authRegistered: false,
-  });
-
-  await boundary.reconcileTerminalSession("user-1");
-
-  assert.equal(indexOfCall(calls, "logout"), -1);
-  assert.ok(indexOfCall(calls, "disconnect") >= 0);
-});
-
-test("CONNECTED state is never torn down by terminal reconciliation", async () => {
-  const { boundary, calls } = createHarness({
-    status: "CONNECTED",
-  });
-
-  await boundary.reconcileTerminalSession("user-1");
-
-  assert.deepEqual(calls, [["getDb", "user-1"]]);
-});
-
-test("missing credentials cannot be disguised as a successful disconnect", async () => {
+test("missing credentials cannot be disguised as a successful explicit disconnect", async () => {
   const { boundary, calls, getDbSession } = createHarness({
     status: "CONNECTED",
     hasRuntime: false,
@@ -245,11 +312,9 @@ test("missing credentials cannot be disguised as a successful disconnect", async
 
   await assert.rejects(
     boundary.disconnectManagedSessionSafely("user-1"),
-    (error) =>
-      error?.status === 409 &&
-      error?.details?.code === "REMOTE_LOGOUT_UNAVAILABLE"
+    (error) => error?.status === 409 && error?.details?.code === "REMOTE_LOGOUT_UNAVAILABLE"
   );
 
   assert.equal(getDbSession().status, "CONNECTED");
-  assert.equal(indexOfCall(calls, "disconnect"), -1);
+  assert.equal(indexOfCall(calls, "clearAuth"), -1);
 });
