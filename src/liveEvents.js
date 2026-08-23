@@ -28,6 +28,16 @@ function cacheSessionOwner(row) {
   return row;
 }
 
+async function userForSession(sessionId) {
+  if (!sessionId) return null;
+
+  const cached = sessionOwners.get(String(sessionId));
+  if (cached) return cached;
+
+  const row = await repository.getWhatsappSessionById(sessionId);
+  return row?.user_id || null;
+}
+
 function deliverPending(userId) {
   const key = String(userId || "");
   const queued = pending.get(key);
@@ -169,14 +179,25 @@ export function installRepositoryLiveEvents() {
     const result = await originalInsertMessage(input, ...rest);
     if (!result) return result;
 
-    const sessionId = input?.session_id;
-    let userId = sessionOwners.get(String(sessionId || ""));
-    if (!userId && sessionId) {
-      const row = await repository.getWhatsappSessionById(sessionId);
-      userId = row?.user_id || null;
-    }
+    const userId = await userForSession(input?.session_id || result?.session_id);
     if (userId) {
       publishUserChange(userId, ["messages", "activity"], "message_write");
+    }
+    return result;
+  };
+
+  const originalUpdateMessage = repository.updateMessage.bind(repository);
+  repository.updateMessage = async (messageId, patch, ...rest) => {
+    const result = await originalUpdateMessage(messageId, patch, ...rest);
+    if (!result) return result;
+
+    const userId = await userForSession(result.session_id);
+    if (userId) {
+      publishUserChange(
+        userId,
+        ["messages", "activity"],
+        "message_processing_update"
+      );
     }
     return result;
   };
