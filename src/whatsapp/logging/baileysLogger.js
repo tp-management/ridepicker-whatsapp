@@ -1,4 +1,4 @@
-import { writeSystemLog } from "./systemLog.js";
+import { writeSystemLog } from "../../systemLog.js";
 
 const LEVEL_MAP = {
   trace: "debug",

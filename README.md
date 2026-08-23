@@ -6,6 +6,7 @@ RidePicker backend v1 combines:
 - Baileys WhatsApp sessions
 - QR pairing and phone-number pairing codes
 - Supabase/PostgREST persistence
+- encrypted Supabase persistence for Baileys credentials and Signal keys
 - message deduplication and tracking gates
 - controlled n8n forwarding
 - legacy `/send` support for the existing n8n workflow
@@ -17,12 +18,14 @@ Firebase frontend
        ↓
 Railway / this backend
        ↓
-Supabase PostgreSQL
+Supabase PostgreSQL + Vault
        ↓
 Baileys / WhatsApp
        ↓
 n8n AI parser
 ```
+
+The backend is intentionally stateless with respect to its local filesystem. WhatsApp credentials, Signal keys, session state, messages, jobs, activity, and application data are persisted in Supabase. Active sockets, pairing codes, QR data, timers, and short-lived caches exist only in process memory and are rebuilt after restart.
 
 ## Important message behaviour
 
@@ -51,7 +54,7 @@ All private chats and groups are monitored while Assist is active. There is no p
 
 Two connection methods are supported.
 
-### Phone-number pairing code (recommended for mobile users)
+### Phone-number pairing code
 
 The frontend already knows the RidePicker account phone. Calling:
 
@@ -72,11 +75,7 @@ To use a different WhatsApp number:
 }
 ```
 
-The response contains `session.pairingCode.code`.
-
-The customer opens WhatsApp → Linked Devices → Link a device → Link with phone number and enters the code.
-
-The existing Baileys `makeWASocket` options are intentionally unchanged. Pairing-code support is added only through `socket.requestPairingCode()`.
+The response contains `session.pairingCode.code` only after the pairing request has passed the backend's acknowledgement checks. The customer opens WhatsApp → Linked Devices → Link a device → Link with phone number and enters the code.
 
 ### QR fallback
 
@@ -95,59 +94,39 @@ Poll:
 GET /api/users/:userId/whatsapp
 ```
 
-When a QR exists, `session.qr.imageDataUrl` contains the real data URL. Baileys rotates QR codes automatically and the frontend simply keeps polling.
+When a QR exists, `session.qr.imageDataUrl` contains the current data URL.
+
+## WhatsApp auth persistence
+
+Baileys authentication is Supabase-only. `src/whatsapp/auth/supabaseAuthStore.js` stores both credential state and Signal keys through service-role-only RPC functions. Payloads are encrypted before they are stored in `public.whatsapp_auth`; the encryption key is held in Supabase Vault.
+
+The runtime does not create or restore auth folders, JSON credential files, local databases, caches, or Railway-volume state. Obsolete local-storage environment variables are rejected at startup so an old deployment configuration cannot silently reactivate filesystem persistence.
 
 ## Environment
 
-Copy `.env.example` to `.env` locally.
+Copy `.env.example` to `.env` for local development if needed. A local `.env` is configuration input only; the application does not write runtime state to it or to any other local directory.
 
-The supplied `.env` intentionally has these values blank:
-
-```env
-SUPABASE_URL=
-SUPABASE_SERVICE_ROLE_KEY=
-```
-
-Fill them yourself.
-
-`SUPABASE_SERVICE_ROLE_KEY` is a **server-only secret**. Never put it in the Firebase/Vite frontend.
-
-### Local
+Required production values include:
 
 ```env
-PORT=3001
-DATA_DIR=./data
-```
-
-### Railway
-
-Use a Railway Volume mounted at:
-
-```text
-/data
-```
-
-Set:
-
-```env
-DATA_DIR=/data
 SUPABASE_URL=...
 SUPABASE_SERVICE_ROLE_KEY=...
 N8N_WEBHOOK_URL=...
 FRONTEND_ORIGINS=https://ride-picker.web.app
 N8N_FORWARD_SESSION_EVENTS=false
 N8N_FORWARD_MEDIA_WITHOUT_TEXT=false
-RESTORE_LEGACY_SESSIONS=false
 SESSION_POLICY_CACHE_MS=5000
 ```
-
-Do not manually set `PORT` on Railway unless necessary. Railway normally provides it.
 
 Optional:
 
 ```env
 INTERNAL_API_KEY=...
 ```
+
+Do **not** configure a persistent Railway volume for WhatsApp auth. Do not add legacy local-auth directory settings. The service is designed to recover WhatsApp auth from Supabase after process or container replacement.
+
+`SUPABASE_SERVICE_ROLE_KEY` is a server-only secret. Never put it in the Firebase/Vite frontend.
 
 If `INTERNAL_API_KEY` is configured, the legacy `/send` and `/sessions` API requires the same value in `x-api-key` (or `x-ridepicker-key`). `/internal/jobs` always requires this key.
 
@@ -156,8 +135,12 @@ If `INTERNAL_API_KEY` is configured, the legacy `/send` and `/sessions` API requ
 ```bash
 npm install
 npm run check
+npm test
+npm run audit:stateless
 npm run dev
 ```
+
+`npm run audit:stateless` is a regression gate. It scans the production runtime for filesystem dependencies and deleted legacy auth/patch artifacts, verifies the Supabase-only auth boundary, checks repository metadata for old local-data conventions, and verifies that obsolete local-storage environment settings fail closed.
 
 Health:
 
@@ -191,7 +174,7 @@ Main areas:
 
 ## Existing n8n send endpoint
 
-The old contract is preserved:
+The existing contract is preserved:
 
 ```http
 POST /send
@@ -236,6 +219,7 @@ Only a newly stored incoming message is sent by default:
     "participant": "...",
     "participantAlt": "...",
     "fromMe": false,
+    "direction": "incoming",
     "body": "LHR to Mayfair £95 tonight",
     "type": "text",
     "hasMedia": false,
@@ -280,12 +264,6 @@ Each created job is linked to the source message and the message becomes `parsed
 
 ## Security note
 
-The current frontend product flow identifies an account by phone number without OTP. That is fine for current development/demo work, but it is **not production authentication**.
-
-Before onboarding real unrelated customers, add Supabase Auth phone OTP (or another real auth mechanism) and authorize user-specific API routes. CORS alone is not authentication.
-
-## Legacy sessions
-
-The old manual `/sessions` endpoints remain available for compatibility/debugging. `RESTORE_LEGACY_SESSIONS=false` is the safe default so old `dominykas`/`andrius` folders do not start producing unmanaged traffic after deployment.
+The user-facing authentication/ownership hardening is tracked separately from the WhatsApp storage refactor. Do not treat CORS or a frontend API key as user authentication.
 
 DB-managed WhatsApp sessions use UUID session IDs from `public.whatsapp_sessions`.

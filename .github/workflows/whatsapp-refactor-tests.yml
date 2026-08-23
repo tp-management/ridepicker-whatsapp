@@ -1,0 +1,28 @@
+name: WhatsApp refactor tests
+
+on:
+  pull_request:
+    paths:
+      - "index.js"
+      - "src/**"
+      - "test/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".env.example"
+      - ".gitignore"
+      - "README.md"
+      - ".github/workflows/whatsapp-refactor-tests.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run audit:stateless
+      - run: npm run check
