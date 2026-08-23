@@ -4,12 +4,17 @@ import cors from "cors";
 import { FRONTEND_ORIGINS } from "./config.js";
 import assistPreferencesRouter from "./assistPreferencesRoutes.js";
 import activityRouter from "./activityRoutes.js";
-import liveEventsRouter, { publishSuccessfulUserWrite } from "./liveEvents.js";
+import liveEventsRouter, {
+  installRepositoryLiveEvents,
+  publishSuccessfulUserWrite,
+} from "./liveEvents.js";
 import userApiRouter from "./userApiRoutes.js";
 import managedDisconnectRouter from "./whatsapp/managedDisconnectRouter.js";
 import router from "./routes.js";
 
 export function createApp() {
+  installRepositoryLiveEvents();
+
   const app = express();
 
   app.disable("x-powered-by");
@@ -44,9 +49,9 @@ export function createApp() {
   // The stream carries only invalidation scopes, never database row contents.
   app.use(liveEventsRouter);
 
-  // Any successful user-facing mutation publishes the smallest useful refresh
-  // scope after the response has committed. Internal WhatsApp events publish
-  // directly from src/whatsapp.js.
+  // Successful user-facing mutations publish the smallest useful refresh
+  // scope. Internal WhatsApp/session/message writes are covered by repository
+  // hooks installed above, so background events are pushed too.
   app.use("/api/users/:userId", publishSuccessfulUserWrite);
 
   app.use(assistPreferencesRouter);
