@@ -9,7 +9,7 @@
     "start": "node index.js",
     "dev": "nodemon index.js",
     "test": "node --test",
-    "check": "node --check index.js && node --check src/app.js && node --check src/config.js && node --check src/routes.js && node --check src/whatsapp.js && node --check src/repository.js && node --check src/supabase.js && node --check src/utils.js && node --check src/baileysRawLogger.js && node --check src/whatsapp/logging/baileysLogger.js && node --check src/whatsapp/auth/supabaseAuthStore.js"
+    "check": "node --check index.js && node --check src/app.js && node --check src/config.js && node --check src/routes.js && node --check src/userApiRoutes.js && node --check src/userApiRepository.js && node --check src/whatsapp.js && node --check src/repository.js && node --check src/supabase.js && node --check src/utils.js && node --check src/baileysRawLogger.js && node --check src/whatsapp/logging/baileysLogger.js && node --check src/whatsapp/auth/supabaseAuthStore.js"
   },
   "engines": {
     "node": ">=20"
