@@ -1,5 +1,23 @@
 import "dotenv/config";
 
+const OBSOLETE_LOCAL_STORAGE_ENV = [
+  "DATA_DIR",
+  "RESTORE_LEGACY_SESSIONS",
+];
+
+const obsoleteLocalStorageEnv = OBSOLETE_LOCAL_STORAGE_ENV.filter((name) => {
+  const value = process.env[name];
+  return value !== undefined && value !== null && String(value).trim() !== "";
+});
+
+if (obsoleteLocalStorageEnv.length > 0) {
+  throw new Error(
+    `Obsolete local WhatsApp storage configuration detected: ${obsoleteLocalStorageEnv.join(
+      ", "
+    )}. Remove these variables. WhatsApp auth persistence is Supabase-only.`
+  );
+}
+
 function parseBoolean(value, fallback = false) {
   if (value === undefined || value === null || value === "") {
     return fallback;
@@ -16,7 +34,6 @@ function parseCsv(value) {
 }
 
 export const PORT = Number(process.env.PORT) || 3001;
-
 
 export const N8N_WEBHOOK_URL =
   process.env.N8N_WEBHOOK_URL || null;
@@ -49,7 +66,6 @@ export const FRONTEND_ORIGINS = parseCsv(
 
 export const INTERNAL_API_KEY =
   process.env.INTERNAL_API_KEY || "";
-
 
 export const SESSION_POLICY_CACHE_MS =
   Number(process.env.SESSION_POLICY_CACHE_MS) || 5000;
