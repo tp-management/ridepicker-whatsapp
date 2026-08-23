@@ -3,6 +3,7 @@ import cors from "cors";
 
 import { FRONTEND_ORIGINS } from "./config.js";
 import userApiRouter from "./userApiRoutes.js";
+import managedDisconnectRouter from "./whatsapp/managedDisconnectRouter.js";
 import router from "./routes.js";
 
 export function createApp() {
@@ -38,9 +39,13 @@ export function createApp() {
   );
 
   // User-facing data routes are mounted first so normalized reads (notably
-  // preferences and activity-with-messages) own their paths. The legacy router
-  // remains in place for existing endpoints and n8n/debug compatibility.
+  // preferences and activity-with-messages) own their paths.
   app.use(userApiRouter);
+
+  // A user-requested WhatsApp disconnect must remote-unlink the linked device
+  // before durable auth is cleared. Mount this exact route before the legacy
+  // router so no older disconnect implementation can bypass that invariant.
+  app.use(managedDisconnectRouter);
 
   // Pairing lifecycle ownership belongs inside requestManagedPairingCode().
   // Do not reset a WhatsApp session in generic HTTP middleware: concurrent
