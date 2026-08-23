@@ -21,18 +21,15 @@ export async function createWhatsappHarnessFromSource({
 }) {
   const srcDir = path.join(tempRoot, "src");
   const stubDir = path.join(srcDir, "__stubs__");
-  const dataDir = path.join(tempRoot, "data");
   await fs.mkdir(stubDir, { recursive: true });
 
   await writeModule(
     stubDir,
     "config.mjs",
-    `export const DATA_DIR = ${JSON.stringify(dataDir)};\n` +
       `export const N8N_FORWARD_MEDIA_WITHOUT_TEXT = false;\n` +
       `export const N8N_FORWARD_FROM_ME = false;\n` +
       `export const N8N_FORWARD_SESSION_EVENTS = false;\n` +
       `export const N8N_WEBHOOK_URL = \"\";\n` +
-      `export const RESTORE_LEGACY_SESSIONS = false;\n` +
       `export const SESSION_POLICY_CACHE_MS = 1000;\n`
   );
 
@@ -70,16 +67,21 @@ export async function createWhatsappHarnessFromSource({
 
   await writeModule(
     stubDir,
-    "fileAuthStore.mjs",
-    `import { useMultiFileAuthState } from "./baileys.mjs";\n` +
-      `export function ensureFileAuthRoot() {}\n` +
-      `export async function loadFileAuthState() { return useMultiFileAuthState(); }\n`
-  );
-
-  await writeModule(
-    stubDir,
-    "authCleanup.mjs",
-    `export function removeAuthDirectory() {}\n`
+    "supabaseAuthStore.mjs",
+    `const states = new Map();\n` +
+      `function freshState() {\n` +
+      `  const values = new Map();\n` +
+      `  return {\n` +
+      `    creds: { registered: false, pairingCode: undefined, pairingEphemeralKeyPair: { public: Buffer.from(\"ephemeral\") }, noiseKey: { public: Buffer.from(\"noise\") }, me: null },\n` +
+      `    keys: {\n` +
+      `      async get(type, ids) { const result = {}; for (const id of ids) result[id] = values.get(\`\${type}:\${id}\`) ?? null; return result; },\n` +
+      `      async set(data) { for (const type of Object.keys(data || {})) { for (const id of Object.keys(data[type] || {})) { const value = data[type][id]; const key = \`\${type}:\${id}\`; if (value == null) values.delete(key); else values.set(key, value); } } },\n` +
+      `    },\n` +
+      `  };\n` +
+      `}\n` +
+      `export async function loadSupabaseAuthState(sessionId) { let state = states.get(sessionId); if (!state) { state = freshState(); states.set(sessionId, state); } return { state, saveCreds: async () => {} }; }\n` +
+      `export async function clearSupabaseAuthState(sessionId) { states.delete(sessionId); }\n` +
+      `export async function hasSupabaseAuthState(sessionId) { return states.has(sessionId); }\n`
   );
 
   await writeModule(
@@ -104,6 +106,7 @@ export async function createWhatsappHarnessFromSource({
     "repository.mjs",
     `const sessionsByUser = new Map();\n` +
       `const sessionsById = new Map();\n` +
+      `const activities = [];\n` +
       `function ensureRow(userId) {\n` +
       `  let row = sessionsByUser.get(userId);\n` +
       `  if (!row) {\n` +
@@ -121,13 +124,14 @@ export async function createWhatsappHarnessFromSource({
       `  async listWhatsappSessions() { return Array.from(sessionsById.values()); },\n` +
       `  async updateWhatsappSessionById(sessionId, patch) { const row = sessionsById.get(sessionId); if (!row) return null; Object.assign(row, patch); return row; },\n` +
       `  async updateWhatsappSessionByUser(userId, patch) { const row = ensureRow(userId); Object.assign(row, patch); return row; },\n` +
-      `  async addActivity() { return null; },\n` +
+      `  async addActivity(userId, entry) { const row = { userId, ...entry }; activities.push(row); return row; },\n` +
       `  async upsertChat() { return null; },\n` +
       `  async insertMessage() { return null; },\n` +
       `  async updateMessage() { return null; },\n` +
       `};\n` +
       `export function __setSessionStatus(userId, status) { const row = ensureRow(userId); row.status = status; return row; }\n` +
-      `export function __getSessionRow(userId) { return ensureRow(userId); }\n`
+      `export function __getSessionRow(userId) { return ensureRow(userId); }\n` +
+      `export function __getActivities() { return activities; }\n`
   );
 
   await writeModule(
@@ -180,8 +184,7 @@ export async function createWhatsappHarnessFromSource({
     ["./supabase.js", "./__stubs__/supabase.mjs"],
     ["./utils.js", "./__stubs__/utils.mjs"],
     ["./whatsapp/logging/baileysLogger.js", "./__stubs__/baileysRawLogger.mjs"],
-    ["./whatsapp/auth/fileAuthStore.js", "./__stubs__/fileAuthStore.mjs"],
-    ["./whatsapp/auth/authCleanup.js", "./__stubs__/authCleanup.mjs"],
+    ["./whatsapp/auth/supabaseAuthStore.js", "./__stubs__/supabaseAuthStore.mjs"],
     ["./baileysRawLogger.js", "./__stubs__/baileysRawLogger.mjs"],
   ];
 

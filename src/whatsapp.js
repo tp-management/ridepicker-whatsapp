@@ -18,17 +18,16 @@ import {
   N8N_FORWARD_FROM_ME,
   N8N_FORWARD_SESSION_EVENTS,
   N8N_WEBHOOK_URL,
-  RESTORE_LEGACY_SESSIONS,
   SESSION_POLICY_CACHE_MS,
 } from "./config.js";
 import { repository } from "./repository.js";
 import { writeSystemLog } from "./systemLog.js";
 import { createBaileysRawLogger } from "./whatsapp/logging/baileysLogger.js";
 import {
-  ensureFileAuthRoot,
-  loadFileAuthState,
-} from "./whatsapp/auth/fileAuthStore.js";
-import { removeAuthDirectory } from "./whatsapp/auth/authCleanup.js";
+  clearSupabaseAuthState,
+  hasSupabaseAuthState,
+  loadSupabaseAuthState,
+} from "./whatsapp/auth/supabaseAuthStore.js";
 import { isSupabaseConfigured } from "./supabase.js";
 import {
   isoFromWhatsappTimestamp,
@@ -36,7 +35,6 @@ import {
   toFrontendWhatsappStatus,
 } from "./utils.js";
 
-ensureFileAuthRoot();
 
 const BAILEYS_RAW_LOGGING_V1 = true;
 const sessions = new Map();
@@ -578,7 +576,12 @@ function dropSocketSession(
   }
 
   if (removeAuth) {
-    removeAuthDirectory(session.id);
+    void clearSupabaseAuthState(session.id).catch((error) => {
+      console.warn(
+        `[${session.id}] could not clear Supabase auth state:`,
+        error.message
+      );
+    });
   }
 }
 
@@ -1515,7 +1518,7 @@ export async function startSession(
     return existing;
   }
 
-  const { state, saveCreds } = await loadFileAuthState(id);
+  const { state, saveCreds } = await loadSupabaseAuthState(id);
 
   const session = {
     id,
@@ -2385,9 +2388,9 @@ export async function requestManagedPairingCode(userId, phone = null) {
     }
   }
 
-  // A terminal/exhausted previous attempt must start with a completely fresh
-  // auth directory. A registered CONNECTED session is handled above and is
-  // never deleted here.
+  // A terminal/exhausted previous attempt must start with completely fresh
+  // Supabase auth state. A registered CONNECTED session is handled above and
+  // is never deleted here.
   if (!session?.registered && !flow.requestInFlight && !flow.retryTimer) {
     if (
       !session ||
@@ -2402,7 +2405,7 @@ export async function requestManagedPairingCode(userId, phone = null) {
           reason: "Starting fresh managed WhatsApp pairing",
         });
       } else {
-        removeAuthDirectory(dbSession.id);
+        await clearSupabaseAuthState(dbSession.id);
       }
 
       session = await startSession(dbSession.id, {
@@ -2456,7 +2459,7 @@ export async function refreshManagedQr(userId) {
 
   if (!session?.socket) {
     if (dbSession.status === "LOGGED_OUT") {
-      removeAuthDirectory(dbSession.id);
+      await clearSupabaseAuthState(dbSession.id);
     }
 
     session = await startSession(dbSession.id, {
@@ -2534,7 +2537,7 @@ export async function disconnectSession(
       }
 
       sessions.delete(sessionId);
-      removeAuthDirectory(sessionId);
+      await clearSupabaseAuthState(sessionId);
       return;
     }
 
@@ -2549,7 +2552,7 @@ export async function disconnectSession(
     sessions.delete(sessionId);
   }
 
-  removeAuthDirectory(sessionId);
+  await clearSupabaseAuthState(sessionId);
 }
 
 export async function disconnectManagedSession(userId) {
@@ -2746,42 +2749,52 @@ async function restoreManagedSessions() {
   const dbSessions = await repository.listWhatsappSessions();
 
   for (const dbSession of dbSessions) {
-    const authPath = authPathFor(dbSession.id);
+    const terminal = ["LOGGED_OUT", "DISCONNECTED"].includes(
+      dbSession.status
+    );
 
-    if (!fs.existsSync(authPath)) {
-      if (
-        !["LOGGED_OUT", "DISCONNECTED"].includes(dbSession.status)
-      ) {
-        void writeSystemLog({
-          userId: dbSession.user_id,
-          sessionId: dbSession.id,
-          level: "warning",
-          source: "whatsapp",
-          event: "auth_state_missing",
-          message: "WhatsApp auth directory is missing during restore",
-          details: { previousStatus: dbSession.status },
-        });
-
-        await repository.updateWhatsappSessionById(dbSession.id, {
-          status: "DISCONNECTED",
-        });
+    if (terminal) {
+      if (await hasSupabaseAuthState(dbSession.id)) {
+        await clearSupabaseAuthState(dbSession.id);
       }
       continue;
     }
 
-    if (["LOGGED_OUT", "DISCONNECTED"].includes(dbSession.status)) {
-      continue;
-    }
+    const hasAuthState = await hasSupabaseAuthState(dbSession.id);
 
-    // Phone pairing is intentionally memory-driven and auto-rotating. After a
-    // process restart there is no trustworthy live code/timer to resume. Clear
-    // half-finished pairing auth instead of reviving stale credentials. Fully
-    // registered CONNECTED/RECONNECTING sessions still restore normally.
-    if (["STARTING", "QR", "ERROR"].includes(dbSession.status)) {
-      removeAuthDirectory(dbSession.id);
+    if (!hasAuthState) {
+      void writeSystemLog({
+        userId: dbSession.user_id,
+        sessionId: dbSession.id,
+        level: "warning",
+        source: "whatsapp",
+        event: "auth_state_missing",
+        message: "WhatsApp auth state is missing from Supabase during restore",
+        details: { previousStatus: dbSession.status },
+      });
 
       await repository.updateWhatsappSessionById(dbSession.id, {
         status: "DISCONNECTED",
+        bot_mode: "off",
+      });
+
+      await addSessionActivity(
+        { id: dbSession.id, userId: dbSession.user_id },
+        "WhatsApp disconnected",
+        "Connection credentials were unavailable after backend restart."
+      );
+      continue;
+    }
+
+    // Pairing codes and their timers are process-local. Never revive a
+    // half-finished pairing attempt after restart, even though its partial
+    // cryptographic state is safely stored in Supabase.
+    if (["STARTING", "QR", "ERROR"].includes(dbSession.status)) {
+      await clearSupabaseAuthState(dbSession.id);
+
+      await repository.updateWhatsappSessionById(dbSession.id, {
+        status: "DISCONNECTED",
+        bot_mode: "off",
       });
 
       void writeSystemLog({
@@ -2790,11 +2803,15 @@ async function restoreManagedSessions() {
         level: "info",
         source: "whatsapp",
         event: "pairing_reset_after_restart",
-        message:
-          "Incomplete WhatsApp pairing was reset after process restart",
+        message: "Incomplete WhatsApp pairing was reset after process restart",
         details: { previousStatus: dbSession.status },
       });
 
+      await addSessionActivity(
+        { id: dbSession.id, userId: dbSession.user_id },
+        "WhatsApp disconnected",
+        "Incomplete WhatsApp connection was reset after backend restart."
+      );
       continue;
     }
 
@@ -2805,7 +2822,7 @@ async function restoreManagedSessions() {
       level: "info",
       source: "whatsapp",
       event: "session_restore_started",
-      message: "Restoring managed WhatsApp session",
+      message: "Restoring managed WhatsApp session from Supabase auth state",
       details: { previousStatus: dbSession.status },
     });
 
@@ -2833,43 +2850,10 @@ async function restoreManagedSessions() {
   return true;
 }
 
-async function restoreLegacySessions() {
-  if (!RESTORE_LEGACY_SESSIONS) {
-    return;
-  }
-
-  if (!fs.existsSync(DATA_DIR)) {
-    return;
-  }
-
-  const entries = fs.readdirSync(DATA_DIR, {
-    withFileTypes: true,
-  });
-
-  for (const entry of entries) {
-    if (!entry.isDirectory() || sessions.has(entry.name)) {
-      continue;
-    }
-
-    console.log(`Restoring legacy session: ${entry.name}`);
-
-    try {
-      await startSession(entry.name);
-    } catch (error) {
-      console.error(
-        `Failed restoring legacy session ${entry.name}:`,
-        error
-      );
-    }
-  }
-}
-
 export async function restoreSessions() {
   try {
     await restoreManagedSessions();
   } catch (error) {
     console.error("Managed session restore failed:", error.message);
   }
-
-  await restoreLegacySessions();
 }
