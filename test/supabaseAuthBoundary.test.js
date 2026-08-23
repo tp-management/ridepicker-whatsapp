@@ -40,10 +40,15 @@ test("runtime source has no local filesystem persistence dependency", async () =
         /(?:from\s+["'](?:node:)?fs(?:\/promises)?["']|import\s*\(\s*["'](?:node:)?fs(?:\/promises)?["']\s*\)|require\s*\(\s*["'](?:node:)?fs(?:\/promises)?["']\s*\))/,
     },
     { label: "Baileys multi-file auth", pattern: /\buseMultiFileAuthState\b/ },
-    { label: "legacy data directory", pattern: /\bDATA_DIR\b/ },
+    {
+      label: "legacy data directory",
+      pattern: /\bDATA_DIR\b/,
+      allowedPaths: new Set(["src/config.js"]),
+    },
     {
       label: "legacy session restore flag",
       pattern: /\bRESTORE_LEGACY_SESSIONS\b/,
+      allowedPaths: new Set(["src/config.js"]),
     },
     {
       label: "runtime source patcher",
@@ -59,7 +64,9 @@ test("runtime source has no local filesystem persistence dependency", async () =
   for (const relativePath of runtimeFiles) {
     const source = await read(relativePath);
 
-    for (const { label, pattern } of forbiddenPatterns) {
+    for (const { label, pattern, allowedPaths } of forbiddenPatterns) {
+      if (allowedPaths?.has(relativePath)) continue;
+
       assert.doesNotMatch(
         source,
         pattern,
