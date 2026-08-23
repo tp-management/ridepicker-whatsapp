@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 
 import { FRONTEND_ORIGINS } from "./config.js";
+import assistPreferencesRouter from "./assistPreferencesRoutes.js";
 import userApiRouter from "./userApiRoutes.js";
 import managedDisconnectRouter from "./whatsapp/managedDisconnectRouter.js";
 import router from "./routes.js";
@@ -37,6 +38,11 @@ export function createApp() {
       limit: "1mb",
     })
   );
+
+  // Assist keyword preferences are user-facing and must be available before
+  // generic user data routes. Message enforcement itself happens in Supabase
+  // before a non-matching message can enter the messages table or n8n path.
+  app.use(assistPreferencesRouter);
 
   // User-facing data routes are mounted first so normalized reads (notably
   // preferences and activity-with-messages) own their paths.
