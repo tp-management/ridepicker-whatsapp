@@ -1,18 +1,17 @@
 import { repository } from "../repository.js";
 import { writeSystemLog } from "../systemLog.js";
 import {
-  disconnectSession,
   getManagedSession,
   getSession,
   startSession,
   updatePolicyCache,
 } from "../whatsapp.js";
 import {
+  clearSupabaseAuthState,
   hasSupabaseAuthState,
   loadSupabaseAuthState,
 } from "./auth/supabaseAuthStore.js";
 
-const TERMINAL_SESSION_STATUSES = new Set(["LOGGED_OUT", "DISCONNECTED"]);
 const REMOTE_LOGOUT_READY_TIMEOUT_MS = 8_000;
 const REMOTE_LOGOUT_POLL_MS = 100;
 
@@ -29,13 +28,13 @@ function httpError(status, message, details = null) {
 
 export function createManagedSessionBoundary({
   repository: repositoryAdapter,
-  disconnectSession: disconnectSessionAdapter,
   getManagedSession: getManagedSessionAdapter,
   getSession: getSessionAdapter,
   startSession: startSessionAdapter,
   updatePolicyCache: updatePolicyCacheAdapter = () => {},
   hasSupabaseAuthState: hasSupabaseAuthStateAdapter,
   loadSupabaseAuthState: loadSupabaseAuthStateAdapter,
+  clearSupabaseAuthState: clearSupabaseAuthStateAdapter,
   writeSystemLog: writeSystemLogAdapter = async () => {},
   sleep: sleepAdapter = sleep,
   logoutReadyTimeoutMs = REMOTE_LOGOUT_READY_TIMEOUT_MS,
@@ -64,20 +63,16 @@ export function createManagedSessionBoundary({
 
   async function inspectAuth(sessionId) {
     const exists = await hasSupabaseAuthStateAdapter(sessionId);
-
-    if (!exists) {
-      return { exists: false, registered: false };
-    }
+    if (!exists) return { exists: false, registered: false };
 
     const { state } = await loadSupabaseAuthStateAdapter(sessionId);
-
     return {
       exists: true,
       registered: Boolean(state?.creds?.registered),
     };
   }
 
-  function stopRuntimeWithoutClearingAuth(runtimeSession, reason) {
+  function stopRuntimeLocally(runtimeSession, reason) {
     if (!runtimeSession) return;
 
     if (runtimeSession.reconnectTimer) {
@@ -86,17 +81,44 @@ export function createManagedSessionBoundary({
     }
 
     runtimeSession.disposed = true;
-
     const socket = runtimeSession.socket;
     runtimeSession.socket = null;
 
-    if (socket) {
-      try {
-        socket.end?.(new Error(reason));
-      } catch {
-        // The transport may already be closed. Auth is intentionally preserved.
-      }
+    try {
+      socket?.end?.(new Error(reason));
+    } catch {
+      // Local transport cleanup must never turn into a remote logout attempt.
     }
+  }
+
+  async function updateDb(dbSession, patch) {
+    const updated = await repositoryAdapter.updateWhatsappSessionById(
+      dbSession.id,
+      patch
+    );
+    if (updated) updatePolicyCacheAdapter(updated);
+    return updated || { ...dbSession, ...patch };
+  }
+
+  async function cleanupKnownLoggedOut(dbSession) {
+    const runtimeSession = getSessionAdapter(dbSession.id) || null;
+    if (runtimeSession) {
+      stopRuntimeLocally(runtimeSession, "Cleaning already logged-out session");
+    }
+
+    if (await hasSupabaseAuthStateAdapter(dbSession.id)) {
+      await clearSupabaseAuthStateAdapter(dbSession.id);
+    }
+
+    return dbSession;
+  }
+
+  async function cleanupUnregisteredResidue(dbSession, runtimeSession) {
+    if (runtimeSession) {
+      stopRuntimeLocally(runtimeSession, "Cleaning unregistered pairing residue");
+    }
+    await clearSupabaseAuthStateAdapter(dbSession.id);
+    return dbSession;
   }
 
   async function waitForRemoteLogoutReady(sessionId, fallbackSession) {
@@ -105,26 +127,19 @@ export function createManagedSessionBoundary({
 
     while (Date.now() < deadline) {
       runtimeSession = getSessionAdapter(sessionId) || runtimeSession;
-
-      if (!runtimeSession) {
-        return { runtimeSession: null, state: "missing_runtime" };
-      }
-
+      if (!runtimeSession) return { runtimeSession: null, state: "missing_runtime" };
       if (runtimeSession.status === "LOGGED_OUT") {
         return { runtimeSession, state: "already_logged_out" };
       }
-
       if (
         runtimeSession.status === "CONNECTED" ||
         (runtimeSession.registered && runtimeSession.openedOnce)
       ) {
         return { runtimeSession, state: "ready" };
       }
-
       if (!runtimeSession.socket) {
         return { runtimeSession, state: "missing_socket" };
       }
-
       await sleepAdapter(REMOTE_LOGOUT_POLL_MS);
     }
 
@@ -135,47 +150,13 @@ export function createManagedSessionBoundary({
   }
 
   async function updateLoggedOutState(dbSession) {
-    const updated = await repositoryAdapter.updateWhatsappSessionById(
-      dbSession.id,
-      {
-        status: "LOGGED_OUT",
-        bot_mode: "off",
-        whatsapp_phone: null,
-        display_name: null,
-        connected_at: null,
-      }
-    );
-
-    if (updated) {
-      updatePolicyCacheAdapter(updated);
-    }
-
-    return updated || {
-      ...dbSession,
+    return updateDb(dbSession, {
       status: "LOGGED_OUT",
       bot_mode: "off",
       whatsapp_phone: null,
       display_name: null,
       connected_at: null,
-    };
-  }
-
-  async function cleanupKnownLoggedOut(dbSession) {
-    const runtimeSession = getSessionAdapter(dbSession.id) || null;
-    const hasAuthState = await hasSupabaseAuthStateAdapter(dbSession.id);
-
-    if (!runtimeSession && !hasAuthState) {
-      return dbSession;
-    }
-
-    // LOGGED_OUT means WhatsApp already told us the companion is gone, or a
-    // successful native socket.logout() completed. It is therefore safe to
-    // remove local runtime/auth residue without another remote logout attempt.
-    await disconnectSessionAdapter(dbSession.id, {
-      requestRemoteLogout: false,
     });
-
-    return dbSession;
   }
 
   async function finalizeSuccessfulLogout(
@@ -184,21 +165,11 @@ export function createManagedSessionBoundary({
     runtimeSession,
     { reason, recordActivity }
   ) {
-    // Remote logout has completed before this point. Mark the durable state
-    // terminal first, then clear runtime/auth. This ordering means the auth
-    // store is never destroyed while WhatsApp may still consider the linked
-    // device active.
+    // Explicit remote logout succeeded. Only now is it safe to mark LOGGED_OUT,
+    // which also activates the database auth-purge guard.
     const updated = await updateLoggedOutState(dbSession);
-
-    if (runtimeSession) {
-      // socket.logout() already ended the transport. Avoid a duplicate logout
-      // when disconnectSession() performs the local cleanup below.
-      runtimeSession.socket = null;
-    }
-
-    await disconnectSessionAdapter(dbSession.id, {
-      requestRemoteLogout: false,
-    });
+    stopRuntimeLocally(runtimeSession, "Remote WhatsApp logout completed");
+    await clearSupabaseAuthStateAdapter(dbSession.id);
 
     if (recordActivity) {
       await bestEffortActivity(userId, {
@@ -244,7 +215,6 @@ export function createManagedSessionBoundary({
     }
 
     let startedRuntimeForLogout = false;
-
     if (!runtimeSession?.socket) {
       if (!auth.registered) {
         throw httpError(
@@ -253,18 +223,12 @@ export function createManagedSessionBoundary({
           { code: "REMOTE_LOGOUT_UNAVAILABLE" }
         );
       }
-
-      runtimeSession = await startSessionAdapter(dbSession.id, {
-        userId,
-      });
+      runtimeSession = await startSessionAdapter(dbSession.id, { userId });
       startedRuntimeForLogout = true;
     }
 
     try {
-      const readiness = await waitForRemoteLogoutReady(
-        dbSession.id,
-        runtimeSession
-      );
+      const readiness = await waitForRemoteLogoutReady(dbSession.id, runtimeSession);
       runtimeSession = readiness.runtimeSession || runtimeSession;
 
       if (readiness.state === "already_logged_out") {
@@ -278,39 +242,24 @@ export function createManagedSessionBoundary({
         throw httpError(
           503,
           "RidePicker could not reach WhatsApp to remove the linked device. Your saved WhatsApp credentials were preserved so the disconnect can be retried safely.",
-          {
-            code: "REMOTE_LOGOUT_NOT_READY",
-            readiness: readiness.state,
-          }
+          { code: "REMOTE_LOGOUT_NOT_READY", readiness: readiness.state }
         );
       }
 
       await runtimeSession.socket.logout();
-
       return finalizeSuccessfulLogout(dbSession, userId, runtimeSession, {
         reason,
         recordActivity,
       });
     } catch (error) {
-      // startSession() temporarily writes STARTING while it rehydrates a socket.
-      // If remote logout fails, put the durable state back exactly where it was
-      // and preserve Supabase auth for a later retry.
       if (startedRuntimeForLogout) {
-        const restored = await repositoryAdapter.updateWhatsappSessionById(
-          dbSession.id,
-          {
-            status: dbSession.status,
-            bot_mode: dbSession.bot_mode || "off",
-          }
-        );
-        if (restored) updatePolicyCacheAdapter(restored);
+        await updateDb(dbSession, {
+          status: dbSession.status,
+          bot_mode: dbSession.bot_mode || "off",
+        });
       }
 
-      stopRuntimeWithoutClearingAuth(
-        runtimeSession,
-        "Remote WhatsApp logout did not complete"
-      );
-
+      stopRuntimeLocally(runtimeSession, "Remote WhatsApp logout did not complete");
       await bestEffortLog({
         userId,
         sessionId: dbSession.id,
@@ -332,53 +281,87 @@ export function createManagedSessionBoundary({
 
   async function reconcileTerminalSession(userId) {
     const dbSession = await repositoryAdapter.getWhatsappSessionByUser(userId);
+    if (!dbSession) return null;
 
-    if (!dbSession || !TERMINAL_SESSION_STATUSES.has(dbSession.status)) {
-      return dbSession;
-    }
-
+    // A GET or ordinary user-facing WhatsApp action must never unlink a device.
+    // Only confirmed LOGGED_OUT may be cleaned without talking to WhatsApp.
     if (dbSession.status === "LOGGED_OUT") {
       return cleanupKnownLoggedOut(dbSession);
+    }
+
+    if (dbSession.status !== "DISCONNECTED") {
+      return dbSession;
     }
 
     const runtimeSession = getSessionAdapter(dbSession.id) || null;
     const auth = await inspectAuth(dbSession.id);
 
-    if (!runtimeSession && !auth.exists) {
-      return dbSession;
-    }
-
-    const linkedStateMayStillExist = Boolean(
-      runtimeSession?.registered ||
-        runtimeSession?.socket?.user?.id ||
-        auth.registered ||
-        dbSession.connected_at
-    );
-
-    if (!linkedStateMayStillExist) {
-      // Partial/unregistered pairing residue cannot represent a linked device.
-      // It is safe to clear locally.
-      await disconnectSessionAdapter(dbSession.id, {
-        requestRemoteLogout: false,
+    // If the runtime is already healthy, repair the stale durable row instead
+    // of trusting DISCONNECTED over a live registered socket.
+    if (
+      runtimeSession?.registered &&
+      (runtimeSession.status === "CONNECTED" || runtimeSession.openedOnce)
+    ) {
+      return updateDb(dbSession, {
+        status: "CONNECTED",
+        connected_at: dbSession.connected_at || new Date().toISOString(),
       });
-      return dbSession;
     }
 
-    // DISCONNECTED plus registered credentials is a mixed state. Never erase
-    // those credentials first. Rehydrate the session if needed, unlink the
-    // companion through Baileys, and only then clear runtime/auth state.
-    return remoteLogoutAndFinalize(dbSession, userId, {
-      reason: "terminal_state_reconciliation",
-      recordActivity: false,
-    });
+    // Registered auth is recoverable linked-device state. Rehydrate it. Never
+    // call logout and never clear it merely because the DB snapshot says
+    // DISCONNECTED.
+    if (runtimeSession?.registered || auth.registered) {
+      if (runtimeSession?.socket) {
+        return updateDb(dbSession, { status: "RECONNECTING" });
+      }
+
+      try {
+        await updateDb(dbSession, { status: "RECONNECTING" });
+        await startSessionAdapter(dbSession.id, { userId });
+        return repositoryAdapter.getWhatsappSessionByUser(userId);
+      } catch (error) {
+        await bestEffortLog({
+          userId,
+          sessionId: dbSession.id,
+          level: "error",
+          source: "whatsapp",
+          event: "terminal_state_recovery_failed",
+          message: error.message,
+          details: { authPreserved: true, previousStatus: dbSession.status },
+        });
+        throw httpError(
+          503,
+          "RidePicker could not restore the saved WhatsApp session. Credentials were preserved and no device was disconnected.",
+          { code: "WHATSAPP_RECOVERY_FAILED" }
+        );
+      }
+    }
+
+    // connected_at is durable evidence that this row previously represented a
+    // linked device. Missing/unregistered auth is a corruption/recovery case,
+    // not permission to erase state or start a new pairing behind its back.
+    if (dbSession.connected_at) {
+      await updateDb(dbSession, { status: "ERROR", bot_mode: "off" });
+      throw httpError(
+        409,
+        "RidePicker cannot safely recover this previously linked WhatsApp session because usable credentials are unavailable. No device was disconnected.",
+        { code: "WHATSAPP_CREDENTIALS_UNAVAILABLE" }
+      );
+    }
+
+    // Never-connected, unregistered pairing residue has no remote companion to
+    // unlink. Local cleanup is safe and lets a fresh user-requested pair begin.
+    if (runtimeSession || auth.exists) {
+      await cleanupUnregisteredResidue(dbSession, runtimeSession);
+    }
+
+    return dbSession;
   }
 
   async function disconnectManagedSessionSafely(userId) {
     const dbSession = await repositoryAdapter.getWhatsappSessionByUser(userId);
-
-    if (!dbSession) {
-      return null;
-    }
+    if (!dbSession) return null;
 
     if (dbSession.status === "LOGGED_OUT") {
       await cleanupKnownLoggedOut(dbSession);
@@ -397,9 +380,7 @@ export function createManagedSessionBoundary({
 
     if (!linkedStateMayStillExist) {
       const updated = await updateLoggedOutState(dbSession);
-      await disconnectSessionAdapter(dbSession.id, {
-        requestRemoteLogout: false,
-      });
+      await cleanupUnregisteredResidue(dbSession, runtimeSession);
       await bestEffortActivity(userId, {
         type: "whatsapp",
         title: "WhatsApp disconnected",
@@ -424,16 +405,15 @@ export function createManagedSessionBoundary({
 
 const boundary = createManagedSessionBoundary({
   repository,
-  disconnectSession,
   getManagedSession,
   getSession,
   startSession,
   updatePolicyCache,
   hasSupabaseAuthState,
   loadSupabaseAuthState,
+  clearSupabaseAuthState,
   writeSystemLog,
 });
 
 export const reconcileTerminalManagedSession = boundary.reconcileTerminalSession;
-export const disconnectManagedSessionSafely =
-  boundary.disconnectManagedSessionSafely;
+export const disconnectManagedSessionSafely = boundary.disconnectManagedSessionSafely;
