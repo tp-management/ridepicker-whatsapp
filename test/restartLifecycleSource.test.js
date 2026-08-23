@@ -35,10 +35,21 @@ test("ordinary terminal reconciliation cannot invoke remote unlink", async () =>
 test("readiness health router is mounted before application routes", async () => {
   const source = await fs.readFile("src/app.js", "utf8");
   const health = source.indexOf("app.use(healthRouter)");
-  const live = source.indexOf("app.use(liveEventsRouter)");
+  const managed = source.indexOf("app.use(managedDisconnectRouter)");
   const legacy = source.indexOf("app.use(router)");
 
   assert.ok(health >= 0);
-  assert.ok(live > health);
-  assert.ok(legacy > health);
+  assert.ok(managed > health);
+  assert.ok(legacy > managed);
+});
+
+test("legacy durable session DELETE is intercepted by guarded disconnect", async () => {
+  const source = await fs.readFile(
+    "src/whatsapp/managedDisconnectRouter.js",
+    "utf8"
+  );
+
+  assert.match(source, /["']\/sessions\/:id["']/);
+  assert.match(source, /getWhatsappSessionById/);
+  assert.match(source, /disconnectManagedSessionSafely\(dbSession\.user_id\)/);
 });
