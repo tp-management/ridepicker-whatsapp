@@ -149,7 +149,7 @@ test("registered auth restore failure preserves auth and remains recoverable", a
   );
 });
 
-test("one broken durable session cannot stop recovery of another", async () => {
+test("recovery examines every account but blocks readiness if any recovery is unresolved", async () => {
   const calls = [];
   const sessions = [
     { id: "bad", user_id: "u-bad", status: "CONNECTED", connected_at: null },
@@ -173,10 +173,15 @@ test("one broken durable session cannot stop recovery of another", async () => {
     async writeSystemLog(entry) { calls.push(["log", entry.sessionId, entry.event]); },
   });
 
-  const results = await recovery.recoverAll();
+  await assert.rejects(
+    recovery.recoverAll(),
+    (error) => error?.results?.length === 2
+  );
 
-  assert.equal(results.length, 2);
-  assert.equal(results[0].action, "unexpected_failure");
-  assert.equal(results[1].action, "restored_registered");
   assert.ok(calls.some((call) => call[0] === "start" && call[1] === "good"));
+  assert.ok(
+    calls.some(
+      (call) => call[0] === "log" && call[1] === "bad" && call[2] === "session_recovery_unexpected_failure"
+    )
+  );
 });
