@@ -35,6 +35,8 @@ export function createManagedSessionBoundary({
   }
 
   return {
+    reconcileTerminalSession,
+
     async getReconciledManagedSession(userId) {
       await reconcileTerminalSession(userId);
       return getManagedSessionAdapter(userId);
@@ -60,6 +62,7 @@ const boundary = createManagedSessionBoundary({
   startManagedSession,
 });
 
+export const reconcileTerminalManagedSession = boundary.reconcileTerminalSession;
 export const getReconciledManagedSession = boundary.getReconciledManagedSession;
 export const requestFreshManagedPairingCode = boundary.requestFreshManagedPairingCode;
 export const startFreshManagedSession = boundary.startFreshManagedSession;
