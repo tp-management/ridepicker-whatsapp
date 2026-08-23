@@ -1,0 +1,95 @@
+name: Generate auth filesystem extraction
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/generate-auth-extraction.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refactor/whatsapp-modular
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Extract auth filesystem helpers
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import json
+
+          whatsapp = Path("src/whatsapp.js")
+          source = whatsapp.read_text()
+
+          replacements = [
+              ('import fs from "fs";\nimport path from "path";\n', ''),
+              ('  useMultiFileAuthState,\n', ''),
+              ('  DATA_DIR,\n', ''),
+              ('import { createBaileysRawLogger } from "./whatsapp/logging/baileysLogger.js";\n',
+               'import { createBaileysRawLogger } from "./whatsapp/logging/baileysLogger.js";\nimport {\n  ensureFileAuthRoot,\n  loadFileAuthState,\n} from "./whatsapp/auth/fileAuthStore.js";\nimport { removeAuthDirectory } from "./whatsapp/auth/authCleanup.js";\n'),
+              ('fs.mkdirSync(DATA_DIR, {\n  recursive: true,\n});', 'ensureFileAuthRoot();'),
+              ('function authPathFor(sessionId) {\n  return path.join(DATA_DIR, sessionId);\n}\n\nfunction removeAuthDirectory(sessionId) {\n  const authPath = authPathFor(sessionId);\n\n  try {\n    fs.rmSync(authPath, {\n      recursive: true,\n      force: true,\n    });\n  } catch (error) {\n    console.warn(\n      `[${sessionId}] could not remove auth directory:`,\n      error.message\n    );\n  }\n}\n\n', ''),
+              ('  const authPath = authPathFor(id);\n  const { state, saveCreds } = await useMultiFileAuthState(authPath);',
+               '  const { state, saveCreds } = await loadFileAuthState(id);'),
+          ]
+
+          for old, new in replacements:
+              count = source.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected exactly one auth extraction target, got {count}: {old[:80]!r}")
+              source = source.replace(old, new, 1)
+
+          whatsapp.write_text(source)
+
+          auth_dir = Path("src/whatsapp/auth")
+          auth_dir.mkdir(parents=True, exist_ok=True)
+          (auth_dir / "fileAuthStore.js").write_text('''import fs from "fs";\nimport path from "path";\nimport { useMultiFileAuthState } from "@whiskeysockets/baileys";\n\nimport { DATA_DIR } from "../../config.js";\n\nexport function ensureFileAuthRoot() {\n  fs.mkdirSync(DATA_DIR, {\n    recursive: true,\n  });\n}\n\nexport function authPathFor(sessionId) {\n  return path.join(DATA_DIR, sessionId);\n}\n\nexport async function loadFileAuthState(sessionId) {\n  return useMultiFileAuthState(authPathFor(sessionId));\n}\n''')
+          (auth_dir / "authCleanup.js").write_text('''import fs from "fs";\n\nimport { authPathFor } from "./fileAuthStore.js";\n\nexport function removeAuthDirectory(sessionId) {\n  const authPath = authPathFor(sessionId);\n\n  try {\n    fs.rmSync(authPath, {\n      recursive: true,\n      force: true,\n    });\n  } catch (error) {\n    console.warn(\n      `[${sessionId}] could not remove auth directory:`,\n      error.message\n    );\n  }\n}\n''')
+
+          harness = Path("test/helpers/createWhatsappHarness.js")
+          harness_source = harness.read_text()
+          logger_stub = '''  await writeModule(\n    stubDir,\n    "baileysRawLogger.mjs",\n    `export function createBaileysRawLogger() {\\n` +\n      `  const logger = { level: \\"debug\\", trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {} };\\n` +\n      `  logger.child = () => logger;\\n` +\n      `  return logger;\\n` +\n      `}\\n`\n  );\n'''
+          if harness_source.count(logger_stub) != 1:
+              raise SystemExit("expected logger stub insertion point once")
+          auth_stubs = logger_stub + '''\n  await writeModule(\n    stubDir,\n    "fileAuthStore.mjs",\n    `import { useMultiFileAuthState } from "./baileys.mjs";\\n` +\n      `export function ensureFileAuthRoot() {}\\n` +\n      `export async function loadFileAuthState() { return useMultiFileAuthState(); }\\n`\n  );\n\n  await writeModule(\n    stubDir,\n    "authCleanup.mjs",\n    `export function removeAuthDirectory() {}\\n`\n  );\n'''
+          harness_source = harness_source.replace(logger_stub, auth_stubs, 1)
+
+          marker = '    ["./whatsapp/logging/baileysLogger.js", "./__stubs__/baileysRawLogger.mjs"],\n'
+          if harness_source.count(marker) != 1:
+              raise SystemExit("expected current logger replacement once")
+          harness_source = harness_source.replace(
+              marker,
+              marker +
+              '    ["./whatsapp/auth/fileAuthStore.js", "./__stubs__/fileAuthStore.mjs"],\n' +
+              '    ["./whatsapp/auth/authCleanup.js", "./__stubs__/authCleanup.mjs"],\n',
+              1
+          )
+          harness.write_text(harness_source)
+
+          package = Path("package.json")
+          package_data = json.loads(package.read_text())
+          check = package_data["scripts"]["check"]
+          extra = " && node --check src/whatsapp/auth/fileAuthStore.js && node --check src/whatsapp/auth/authCleanup.js"
+          if extra.strip() not in check:
+              package_data["scripts"]["check"] = check + extra
+          package.write_text(json.dumps(package_data, indent=2) + "\n")
+          PY
+      - run: npm ci
+      - run: npm test
+      - run: npm run check
+      - name: Commit auth extraction
+        run: |
+          git config user.name "TravelsPlatform"
+          git config user.email "152078198+tp-management@users.noreply.github.com"
+          git add src/whatsapp.js src/whatsapp/auth/fileAuthStore.js src/whatsapp/auth/authCleanup.js test/helpers/createWhatsappHarness.js package.json
+          git diff --cached --check
+          git commit -m "refactor: extract WhatsApp auth filesystem helpers"
+          git push --force origin HEAD:refs/heads/generated/whatsapp-auth-extraction
