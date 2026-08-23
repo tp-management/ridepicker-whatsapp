@@ -191,12 +191,19 @@ export function createRestartRecovery({
   async function recoverAll() {
     const dbSessions = await repositoryAdapter.listWhatsappSessions();
     const results = [];
+    const blockingFailures = [];
 
-    // Isolate sessions. A corrupt account must not prevent healthy linked
-    // accounts from being restored during the same deployment.
+    // Examine every session even if one fails, so logs contain a complete
+    // picture. Any unresolved infrastructure/recovery failure still keeps the
+    // new container unready, allowing Railway to retain the previous healthy
+    // deployment instead of routing traffic to a half-restored process.
     for (const dbSession of dbSessions || []) {
       try {
-        results.push(await recoverOne(dbSession));
+        const result = await recoverOne(dbSession);
+        results.push(result);
+        if (result.action === "restore_failed_auth_preserved") {
+          blockingFailures.push(result);
+        }
       } catch (error) {
         await log({
           userId: dbSession?.user_id || null,
@@ -207,12 +214,22 @@ export function createRestartRecovery({
           message: asErrorMessage(error),
           details: { previousStatus: dbSession?.status || null },
         });
-        results.push({
+        const result = {
           sessionId: dbSession?.id || null,
           action: "unexpected_failure",
           error,
-        });
+        };
+        results.push(result);
+        blockingFailures.push(result);
       }
+    }
+
+    if (blockingFailures.length) {
+      const error = new Error(
+        `WhatsApp restart recovery has ${blockingFailures.length} unresolved failure(s)`
+      );
+      error.results = results;
+      throw error;
     }
 
     return results;
