@@ -11,10 +11,10 @@ const obsoleteLocalStorageEnv = OBSOLETE_LOCAL_STORAGE_ENV.filter((name) => {
 });
 
 if (obsoleteLocalStorageEnv.length > 0) {
-  throw new Error(
-    `Obsolete local WhatsApp storage configuration detected: ${obsoleteLocalStorageEnv.join(
+  console.warn(
+    `[config] Ignoring obsolete local WhatsApp storage configuration: ${obsoleteLocalStorageEnv.join(
       ", "
-    )}. Remove these variables. WhatsApp auth persistence is Supabase-only.`
+    )}. WhatsApp auth persistence is Supabase-only.`
   );
 }
 

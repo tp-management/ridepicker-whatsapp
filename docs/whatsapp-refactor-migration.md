@@ -23,9 +23,9 @@ WhatsApp auth persistence is Supabase-only:
 - auth read/write/clear RPCs are service-role-only;
 - no runtime auth directory, JSON credential file, local database, or Railway-volume state is used.
 
-The runtime deliberately fails startup if obsolete local-storage configuration variables are still present. This prevents an old deployment configuration from silently reintroducing filesystem persistence.
+Legacy deployment variables such as `DATA_DIR` and `RESTORE_LEGACY_SESSIONS` are ignored by runtime and emit a warning. They cannot re-enable filesystem persistence because production source contains no filesystem persistence dependency. Operators should still remove these obsolete variables and any old Railway volume from infrastructure configuration.
 
-`npm run audit:stateless` is the permanent regression gate for this boundary. It scans all production JavaScript under `index.js` and `src/`, rejects filesystem module dependencies and legacy auth/storage identifiers, verifies the Supabase-only auth interface, checks that obsolete source artifacts and the old `data/` convention are absent, and verifies fail-closed handling of old storage environment variables.
+`npm run audit:stateless` is the permanent regression gate for this boundary. It scans all production JavaScript under `index.js` and `src/`, rejects filesystem module dependencies and legacy auth/storage identifiers, verifies the Supabase-only auth interface, checks that obsolete source artifacts and the old `data/` convention are absent, and verifies that obsolete storage environment variables cannot block startup or reactivate local persistence.
 
 ## Current extraction path
 

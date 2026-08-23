@@ -136,7 +136,7 @@ test("legacy local-storage source artifacts are absent", async () => {
   }
 });
 
-test("obsolete local-storage environment variables fail closed", () => {
+test("obsolete local-storage environment variables are ignored, never used", () => {
   for (const name of ["DATA_DIR", "RESTORE_LEGACY_SESSIONS"]) {
     const result = spawnSync(
       process.execPath,
@@ -153,10 +153,10 @@ test("obsolete local-storage environment variables fail closed", () => {
       }
     );
 
-    assert.notEqual(result.status, 0, `${name} must reject startup`);
+    assert.equal(result.status, 0, `${name} must not block startup`);
     assert.match(
       `${result.stderr}\n${result.stdout}`,
-      /Obsolete local WhatsApp storage configuration detected/
+      /Ignoring obsolete local WhatsApp storage configuration/
     );
   }
 });
