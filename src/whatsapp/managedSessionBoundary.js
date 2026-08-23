@@ -13,6 +13,12 @@ import {
   loadSupabaseAuthState,
 } from "./auth/supabaseAuthStore.js";
 
+const RECOVERABLE_SNAPSHOT_STATUSES = new Set([
+  "DISCONNECTED",
+  "ERROR",
+  "STARTING",
+  "QR",
+]);
 const REMOTE_LOGOUT_READY_TIMEOUT_MS = 8_000;
 const REMOTE_LOGOUT_POLL_MS = 100;
 
@@ -301,21 +307,24 @@ export function createManagedSessionBoundary({
     const dbSession = await repositoryAdapter.getWhatsappSessionByUser(userId);
     if (!dbSession) return null;
 
-    // A GET or ordinary user-facing WhatsApp action must never unlink a device.
-    // Only confirmed LOGGED_OUT may be cleaned without talking to WhatsApp.
+    // Ordinary GET/POST WhatsApp routes are never permission to unlink a
+    // companion. LOGGED_OUT is already confirmed terminal and may only receive
+    // local residue cleanup.
     if (dbSession.status === "LOGGED_OUT") {
       return cleanupKnownLoggedOut(dbSession);
     }
 
-    if (dbSession.status !== "DISCONNECTED") {
+    if (["CONNECTED", "RECONNECTING"].includes(dbSession.status)) {
+      return dbSession;
+    }
+
+    if (!RECOVERABLE_SNAPSHOT_STATUSES.has(dbSession.status)) {
       return dbSession;
     }
 
     const runtimeSession = getSessionAdapter(dbSession.id) || null;
     const auth = await inspectAuth(dbSession.id);
 
-    // If the runtime is already healthy, repair the stale durable row instead
-    // of trusting DISCONNECTED over a live registered socket.
     if (
       runtimeSession?.registered &&
       (runtimeSession.status === "CONNECTED" || runtimeSession.openedOnce)
@@ -326,9 +335,10 @@ export function createManagedSessionBoundary({
       });
     }
 
-    // Registered auth is recoverable linked-device state. Rehydrate it. Never
-    // call logout and never clear it merely because the DB snapshot says
-    // DISCONNECTED.
+    // A registered runtime/auth state is recoverable for every transient
+    // durable snapshot, not just DISCONNECTED. This protects ERROR/STARTING/QR
+    // from downstream "fresh pairing" code that is allowed to clear only truly
+    // unregistered pairing residue.
     if (runtimeSession?.registered || auth.registered) {
       if (runtimeSession?.socket) {
         return updateDb(dbSession, { status: "RECONNECTING" });
@@ -356,9 +366,9 @@ export function createManagedSessionBoundary({
       }
     }
 
-    // connected_at is durable evidence that this row previously represented a
-    // linked device. Missing/unregistered auth is a corruption/recovery case,
-    // not permission to erase state or start a new pairing behind its back.
+    // connected_at is durable evidence of a previously linked device. Missing
+    // or unregistered credentials are a recovery problem, never a signal to
+    // erase more state or silently start a new pair.
     if (dbSession.connected_at) {
       await updateDb(dbSession, { status: "ERROR", bot_mode: "off" });
       throw httpError(
@@ -368,8 +378,14 @@ export function createManagedSessionBoundary({
       );
     }
 
-    // Never-connected, unregistered pairing residue has no remote companion to
-    // unlink. Local cleanup is safe and lets a fresh user-requested pair begin.
+    // Do not interfere with an active or failed unregistered pairing lifecycle.
+    // The pairing service owns STARTING/QR/ERROR cleanup and retry semantics.
+    if (dbSession.status !== "DISCONNECTED") {
+      return dbSession;
+    }
+
+    // A never-connected DISCONNECTED row can only contain partial pairing
+    // residue, so local cleanup is safe and contains no remote logout call.
     if (runtimeSession || auth.exists) {
       await cleanupUnregisteredResidue(dbSession, runtimeSession);
     }
