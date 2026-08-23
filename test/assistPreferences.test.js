@@ -40,17 +40,22 @@ test("Assist keyword sanitizer trims, deduplicates, and enforces limits", () => 
   );
 });
 
-test("database trigger skips unmatched inbound rows before runtime forwarding", async () => {
-  const sql = await fs.readFile(
+test("database trigger strictly skips unmatched rows regardless of message direction", async () => {
+  const initialSql = await fs.readFile(
     "supabase/migrations/20260823_add_assist_keyword_filter.sql",
     "utf8"
   );
+  const strictSql = await fs.readFile(
+    "supabase/migrations/20260823_strict_assist_keyword_storage_filter.sql",
+    "utf8"
+  );
 
-  assert.match(sql, /ADD COLUMN IF NOT EXISTS assist_keywords text\[\]/i);
-  assert.match(sql, /BEFORE INSERT ON public\.messages/i);
-  assert.match(sql, /IF COALESCE\(NEW\.from_me, false\) THEN[\s\S]*RETURN NEW/i);
-  assert.match(sql, /position\(normalized_keyword IN normalized_body\) > 0/i);
-  assert.match(sql, /No configured keyword[\s\S]*RETURN NULL/i);
+  assert.match(initialSql, /ADD COLUMN IF NOT EXISTS assist_keywords text\[\]/i);
+  assert.match(initialSql, /BEFORE INSERT ON public\.messages/i);
+  assert.doesNotMatch(strictSql, /IF COALESCE\(NEW\.from_me, false\)/i);
+  assert.match(strictSql, /position\(normalized_keyword IN normalized_body\) > 0/i);
+  assert.match(strictSql, /unmatched messages never enter messages/i);
+  assert.match(strictSql, /RETURN NULL/i);
 });
 
 test("Assist preferences API only allows writes while WhatsApp is connected", async () => {
