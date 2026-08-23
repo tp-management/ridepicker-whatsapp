@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createPatchedWhatsappHarness } from "./helpers/createPatchedWhatsappHarness.js";
+import { createCurrentWhatsappHarness } from "./helpers/createCurrentWhatsappHarness.js";
 
 const PHONE = "+37061234567";
 
@@ -47,7 +47,7 @@ function clearRuntimeTimers(whatsapp) {
 }
 
 async function useHarness(t) {
-  const harness = await createPatchedWhatsappHarness();
+  const harness = await createCurrentWhatsappHarness();
   t.after(async () => {
     clearRuntimeTimers(harness.whatsapp);
     await harness.cleanup();
