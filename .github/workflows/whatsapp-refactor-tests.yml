@@ -8,6 +8,8 @@ on:
       - "test/**"
       - "package.json"
       - "package-lock.json"
+      - ".gitignore"
+      - "README.md"
       - ".github/workflows/whatsapp-refactor-tests.yml"
 
 jobs:
@@ -21,4 +23,5 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      - run: npm run audit:stateless
       - run: npm run check
