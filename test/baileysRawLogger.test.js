@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createBaileysRawLogger } from "../src/baileysRawLogger.js";
+import { createBaileysRawLogger } from "../src/whatsapp/logging/baileysLogger.js";
 
 function captureLogger() {
   const persisted = [];
