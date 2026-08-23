@@ -4,6 +4,7 @@ import cors from "cors";
 import { FRONTEND_ORIGINS } from "./config.js";
 import assistPreferencesRouter from "./assistPreferencesRoutes.js";
 import activityRouter from "./activityRoutes.js";
+import healthRouter from "./healthRouter.js";
 import liveEventsRouter, {
   installRepositoryLiveEvents,
   publishSuccessfulUserWrite,
@@ -44,6 +45,11 @@ export function createApp() {
       limit: "1mb",
     })
   );
+
+  // Railway only moves traffic to a new container after restart recovery has
+  // examined every durable WhatsApp session. The legacy /health route mounted
+  // later remains unreachable because this router answers first.
+  app.use(healthRouter);
 
   // One persistent server-sent event stream replaces periodic browser polling.
   // The stream carries only invalidation scopes, never database row contents.
