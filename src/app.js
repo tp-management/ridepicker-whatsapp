@@ -2,6 +2,8 @@ import express from "express";
 import cors from "cors";
 
 import { FRONTEND_ORIGINS } from "./config.js";
+import authRouter from "./authRoutes.js";
+import { createApiSecurityMiddleware } from "./apiSecurity.js";
 import userApiRouter from "./userApiRoutes.js";
 import router from "./routes.js";
 
@@ -36,6 +38,12 @@ export function createApp() {
       limit: "1mb",
     })
   );
+
+  // Verified phone authentication is the only unauthenticated account entry
+  // point. Every /api/users/:userId request is then checked against the
+  // Supabase Auth subject before the existing route handlers run.
+  app.use(authRouter);
+  app.use(createApiSecurityMiddleware());
 
   // User-facing data routes are mounted first so normalized reads (notably
   // preferences and activity-with-messages) own their paths. The legacy router
