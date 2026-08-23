@@ -5,6 +5,7 @@ import { repository } from "./repository.js";
 import { writeSystemLog } from "./systemLog.js";
 import { isSupabaseConfigured } from "./supabase.js";
 import { createHttpError } from "./utils.js";
+import { reconcileTerminalManagedSession } from "./whatsapp/managedSessionBoundary.js";
 import {
   disconnectManagedSession,
   disconnectSession,
@@ -93,6 +94,18 @@ async function requireUser(req, res, next) {
     }
 
     req.ridePickerUser = user;
+    next();
+  } catch (error) {
+    sendError(res, error);
+  }
+}
+
+async function reconcileTerminalWhatsapp(req, res, next) {
+  try {
+    // A terminal DB state is authoritative. Before exposing or acting on a
+    // disconnected WhatsApp session, fully remove any stale Baileys runtime
+    // and Supabase auth state so the next pairing always starts clean.
+    await reconcileTerminalManagedSession(req.params.userId);
     next();
   } catch (error) {
     sendError(res, error);
@@ -339,6 +352,7 @@ router.get(
   "/api/users/:userId/whatsapp",
   requireSupabase,
   requireUser,
+  reconcileTerminalWhatsapp,
   async (req, res) => {
     try {
       const session = await getManagedSession(req.params.userId);
@@ -354,6 +368,7 @@ router.post(
   "/api/users/:userId/whatsapp/start",
   requireSupabase,
   requireUser,
+  reconcileTerminalWhatsapp,
   async (req, res) => {
     try {
       const method = req.body?.method || "qr";
@@ -379,6 +394,7 @@ router.post(
   "/api/users/:userId/whatsapp/pairing-code",
   requireSupabase,
   requireUser,
+  reconcileTerminalWhatsapp,
   async (req, res) => {
     try {
       const session = await requestManagedPairingCode(
@@ -398,6 +414,7 @@ router.post(
   "/api/users/:userId/whatsapp/refresh-qr",
   requireSupabase,
   requireUser,
+  reconcileTerminalWhatsapp,
   async (req, res) => {
     try {
       const session = await refreshManagedQr(req.params.userId);
@@ -413,6 +430,7 @@ router.post(
   "/api/users/:userId/whatsapp/reconnect",
   requireSupabase,
   requireUser,
+  reconcileTerminalWhatsapp,
   async (req, res) => {
     try {
       const session = await retryManagedSession(req.params.userId);
@@ -428,6 +446,7 @@ router.delete(
   "/api/users/:userId/whatsapp",
   requireSupabase,
   requireUser,
+  reconcileTerminalWhatsapp,
   async (req, res) => {
     try {
       const session = await disconnectManagedSession(req.params.userId);
