@@ -40,6 +40,28 @@ export function createManagedSessionBoundary({
   sleep: sleepAdapter = sleep,
   logoutReadyTimeoutMs = REMOTE_LOGOUT_READY_TIMEOUT_MS,
 }) {
+  async function bestEffortLog(entry) {
+    try {
+      await writeSystemLogAdapter(entry);
+    } catch (error) {
+      console.warn(
+        `[${entry?.sessionId || "whatsapp"}] system log write failed:`,
+        error.message
+      );
+    }
+  }
+
+  async function bestEffortActivity(userId, entry) {
+    try {
+      await repositoryAdapter.addActivity(userId, entry);
+    } catch (error) {
+      console.warn(
+        `[${entry?.type || "whatsapp"}] activity write failed:`,
+        error.message
+      );
+    }
+  }
+
   async function inspectAuth(sessionId) {
     const exists = await hasSupabaseAuthStateAdapter(sessionId);
 
@@ -179,14 +201,14 @@ export function createManagedSessionBoundary({
     });
 
     if (recordActivity) {
-      await repositoryAdapter.addActivity(userId, {
+      await bestEffortActivity(userId, {
         type: "whatsapp",
         title: "WhatsApp disconnected",
         detail: "",
       });
     }
 
-    await writeSystemLogAdapter({
+    await bestEffortLog({
       userId,
       sessionId: dbSession.id,
       level: "info",
@@ -289,7 +311,7 @@ export function createManagedSessionBoundary({
         "Remote WhatsApp logout did not complete"
       );
 
-      await writeSystemLogAdapter({
+      await bestEffortLog({
         userId,
         sessionId: dbSession.id,
         level: "warning",
@@ -378,7 +400,7 @@ export function createManagedSessionBoundary({
       await disconnectSessionAdapter(dbSession.id, {
         requestRemoteLogout: false,
       });
-      await repositoryAdapter.addActivity(userId, {
+      await bestEffortActivity(userId, {
         type: "whatsapp",
         title: "WhatsApp disconnected",
         detail: "",
