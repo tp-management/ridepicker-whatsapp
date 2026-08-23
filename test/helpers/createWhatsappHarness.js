@@ -70,6 +70,20 @@ export async function createWhatsappHarnessFromSource({
 
   await writeModule(
     stubDir,
+    "fileAuthStore.mjs",
+    `import { useMultiFileAuthState } from "./baileys.mjs";\n` +
+      `export function ensureFileAuthRoot() {}\n` +
+      `export async function loadFileAuthState() { return useMultiFileAuthState(); }\n`
+  );
+
+  await writeModule(
+    stubDir,
+    "authCleanup.mjs",
+    `export function removeAuthDirectory() {}\n`
+  );
+
+  await writeModule(
+    stubDir,
     "qrcode.mjs",
     `export default { async toDataURL(value) { return \`data:image/png;base64,\${String(value)}\`; } };\n`
   );
@@ -166,6 +180,8 @@ export async function createWhatsappHarnessFromSource({
     ["./supabase.js", "./__stubs__/supabase.mjs"],
     ["./utils.js", "./__stubs__/utils.mjs"],
     ["./whatsapp/logging/baileysLogger.js", "./__stubs__/baileysRawLogger.mjs"],
+    ["./whatsapp/auth/fileAuthStore.js", "./__stubs__/fileAuthStore.mjs"],
+    ["./whatsapp/auth/authCleanup.js", "./__stubs__/authCleanup.mjs"],
     ["./baileysRawLogger.js", "./__stubs__/baileysRawLogger.mjs"],
   ];
 

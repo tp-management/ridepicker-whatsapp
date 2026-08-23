@@ -1,5 +1,3 @@
-import fs from "fs";
-import path from "path";
 import { randomBytes } from "crypto";
 import QRCode from "qrcode";
 import { Boom } from "@hapi/boom";
@@ -7,7 +5,6 @@ import { Boom } from "@hapi/boom";
 import makeWASocket, {
   DisconnectReason,
   fetchLatestWaWebVersion,
-  useMultiFileAuthState,
   aesEncryptCTR,
   bytesToCrockford,
   derivePairingCodeKey,
@@ -17,7 +14,6 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 
 import {
-  DATA_DIR,
   N8N_FORWARD_MEDIA_WITHOUT_TEXT,
   N8N_FORWARD_FROM_ME,
   N8N_FORWARD_SESSION_EVENTS,
@@ -28,6 +24,11 @@ import {
 import { repository } from "./repository.js";
 import { writeSystemLog } from "./systemLog.js";
 import { createBaileysRawLogger } from "./whatsapp/logging/baileysLogger.js";
+import {
+  ensureFileAuthRoot,
+  loadFileAuthState,
+} from "./whatsapp/auth/fileAuthStore.js";
+import { removeAuthDirectory } from "./whatsapp/auth/authCleanup.js";
 import { isSupabaseConfigured } from "./supabase.js";
 import {
   isoFromWhatsappTimestamp,
@@ -35,9 +36,7 @@ import {
   toFrontendWhatsappStatus,
 } from "./utils.js";
 
-fs.mkdirSync(DATA_DIR, {
-  recursive: true,
-});
+ensureFileAuthRoot();
 
 const BAILEYS_RAW_LOGGING_V1 = true;
 const sessions = new Map();
@@ -152,26 +151,6 @@ function logWhatsappEvent(
     message,
     details,
   });
-}
-
-function authPathFor(sessionId) {
-  return path.join(DATA_DIR, sessionId);
-}
-
-function removeAuthDirectory(sessionId) {
-  const authPath = authPathFor(sessionId);
-
-  try {
-    fs.rmSync(authPath, {
-      recursive: true,
-      force: true,
-    });
-  } catch (error) {
-    console.warn(
-      `[${sessionId}] could not remove auth directory:`,
-      error.message
-    );
-  }
 }
 
 function socketAccount(socket) {
@@ -1536,8 +1515,7 @@ export async function startSession(
     return existing;
   }
 
-  const authPath = authPathFor(id);
-  const { state, saveCreds } = await useMultiFileAuthState(authPath);
+  const { state, saveCreds } = await loadFileAuthState(id);
 
   const session = {
     id,
