@@ -223,6 +223,21 @@ test("registered pairing followed by 515 enters lifecycle restart path", async (
 
   assert.equal(session.status, "RECONNECTING");
   assert.ok(session.reconnectTimer, "expected lifecycle reconnect timer");
+
+  await waitFor(() => harness.baileys.__getSockets().length === 2);
+  const replacementSocket = harness.baileys.__getSockets()[1];
+  const replacementSession =
+    harness.whatsapp.__characterization.sessions.get("session-restart-515");
+
+  assert.notEqual(replacementSocket, socket);
+  assert.ok(replacementSession, "expected replacement session");
+  assert.notEqual(replacementSession, session);
+  assert.equal(replacementSession.registered, true);
+  assert.equal(replacementSocket.authState.creds.registered, true);
+  assert.equal(
+    replacementSocket.authState.creds.me?.id,
+    socket.authState.creds.me?.id
+  );
 });
 
 test("managed logout uses Baileys native socket.logout", async (t) => {
@@ -264,4 +279,24 @@ test("repeated reconnect triggers do not schedule duplicate active reconnects", 
 
   assert.equal(session.reconnectTimer, firstTimer);
   assert.equal(harness.baileys.__getSockets().length, 1);
+});
+
+test("restore without Supabase auth records an infrastructure disconnect", async (t) => {
+  const harness = await useHarness(t);
+  const userId = "restore-missing-auth";
+  await harness.repositoryStub.repository.ensureWhatsappSession(userId);
+  harness.repositoryStub.__setSessionStatus(userId, "CONNECTED");
+
+  await harness.whatsapp.restoreSessions();
+
+  assert.equal(harness.repositoryStub.__getSessionRow(userId).status, "DISCONNECTED");
+  assert.ok(
+    harness.repositoryStub.__getActivities().some(
+      (entry) =>
+        entry.userId === userId &&
+        entry.type === "whatsapp" &&
+        entry.title === "WhatsApp disconnected"
+    ),
+    "expected restore disconnect to be visible in Activity"
+  );
 });
