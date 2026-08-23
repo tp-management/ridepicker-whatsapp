@@ -4,6 +4,8 @@ import fs from "node:fs/promises";
 
 const MIGRATION =
   "supabase/migrations/20260823_protect_whatsapp_remote_unlink.sql";
+const LOCK_GUARD_MIGRATION =
+  "supabase/migrations/20260823_lock_whatsapp_delete_guard_function.sql";
 
 test("database prevents session deletion from cascading away WhatsApp auth", async () => {
   const sql = await fs.readFile(MIGRATION, "utf8");
@@ -23,6 +25,15 @@ test("bulk auth clear refuses established linked-device auth before LOGGED_OUT",
   assert.match(
     sql,
     /CREATE OR REPLACE FUNCTION public\.ridepicker_whatsapp_auth_clear\([\s\S]*ridepicker_whatsapp_auth_clear_safe/i
+  );
+});
+
+test("delete guard trigger function is not exposed as a SECURITY DEFINER RPC", async () => {
+  const sql = await fs.readFile(LOCK_GUARD_MIGRATION, "utf8");
+
+  assert.match(
+    sql,
+    /REVOKE ALL ON FUNCTION public\.prevent_whatsapp_session_delete_with_auth\(\)[\s\S]*FROM PUBLIC, anon, authenticated, service_role/i
   );
 });
 
