@@ -43,13 +43,18 @@ test("readiness health router is mounted before application routes", async () =>
   assert.ok(legacy > managed);
 });
 
-test("legacy durable session DELETE is intercepted by guarded disconnect", async () => {
+test("legacy DELETE is fail-closed and durable sessions use guarded disconnect", async () => {
   const source = await fs.readFile(
     "src/whatsapp/managedDisconnectRouter.js",
     "utf8"
   );
+  const legacyDelete = source.split('router.delete(\n  "/sessions/:id"')[1];
 
-  assert.match(source, /["']\/sessions\/:id["']/);
-  assert.match(source, /getWhatsappSessionById/);
-  assert.match(source, /disconnectManagedSessionSafely\(dbSession\.user_id\)/);
+  assert.ok(legacyDelete, "expected intercepted legacy DELETE route");
+  assert.match(legacyDelete, /requireInternalKey/);
+  assert.match(legacyDelete, /getWhatsappSessionById/);
+  assert.match(legacyDelete, /disconnectManagedSessionSafely\(dbSession\.user_id\)/);
+  assert.match(legacyDelete, /requestRemoteLogout:\s*linkedRuntime/);
+  assert.match(legacyDelete, /no credentials were removed/);
+  assert.doesNotMatch(legacyDelete, /return next\(\)/);
 });
