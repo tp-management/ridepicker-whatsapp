@@ -1,0 +1,91 @@
+name: Generate current WhatsApp harness
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/generate-current-harness.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refactor/whatsapp-modular
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Build current-source harness
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          helper = Path("test/helpers/createPatchedWhatsappHarness.js")
+          source = helper.read_text()
+
+          generic = source.replace(
+              'import { materializeCurrentPatchedWhatsapp } from "./materializePatchedWhatsapp.js";\n\n',
+              ''
+          )
+          generic = generic.replace(
+              'export async function createPatchedWhatsappHarness() {\n  const materialized = await materializeCurrentPatchedWhatsapp();\n  const srcDir = path.join(materialized.tempRoot, "src");',
+              'export async function createWhatsappHarnessFromSource({\n  source: sourceInput,\n  tempRoot,\n  cleanup = async () => {},\n}) {\n  const srcDir = path.join(tempRoot, "src");'
+          )
+          generic = generic.replace(
+              'const dataDir = path.join(materialized.tempRoot, "data");',
+              'const dataDir = path.join(tempRoot, "data");'
+          )
+          generic = generic.replace('let source = materialized.source;', 'let source = sourceInput;')
+          generic = generic.replace(
+              '["./baileysRawLogger.js", "./__stubs__/baileysRawLogger.mjs"],',
+              '["./whatsapp/logging/baileysLogger.js", "./__stubs__/baileysRawLogger.mjs"],\n    ["./baileysRawLogger.js", "./__stubs__/baileysRawLogger.mjs"],'
+          )
+          generic = generic.replace('cleanup: materialized.cleanup,', 'cleanup,')
+
+          required = [
+              'export async function createWhatsappHarnessFromSource',
+              'const dataDir = path.join(tempRoot, "data");',
+              'let source = sourceInput;',
+              '["./whatsapp/logging/baileysLogger.js", "./__stubs__/baileysRawLogger.mjs"],',
+              'cleanup,',
+          ]
+          for needle in required:
+              if needle not in generic:
+                  raise SystemExit(f"missing transformed harness marker: {needle}")
+
+          Path("test/helpers/createWhatsappHarness.js").write_text(generic)
+
+          helper.write_text('''import { materializeCurrentPatchedWhatsapp } from "./materializePatchedWhatsapp.js";\nimport { createWhatsappHarnessFromSource } from "./createWhatsappHarness.js";\n\nexport async function createPatchedWhatsappHarness() {\n  const materialized = await materializeCurrentPatchedWhatsapp();\n\n  return createWhatsappHarnessFromSource({\n    source: materialized.source,\n    tempRoot: materialized.tempRoot,\n    cleanup: materialized.cleanup,\n  });\n}\n''')
+
+          Path("test/helpers/createCurrentWhatsappHarness.js").write_text('''import fs from "node:fs/promises";\nimport os from "node:os";\nimport path from "node:path";\n\nimport { createWhatsappHarnessFromSource } from "./createWhatsappHarness.js";\n\nexport async function createCurrentWhatsappHarness() {\n  const tempRoot = await fs.mkdtemp(\n    path.join(os.tmpdir(), "ridepicker-whatsapp-current-")\n  );\n  const source = await fs.readFile(\n    path.join(process.cwd(), "src", "whatsapp.js"),\n    "utf8"\n  );\n\n  return createWhatsappHarnessFromSource({\n    source,\n    tempRoot,\n    cleanup: () => fs.rm(tempRoot, { recursive: true, force: true }),\n  });\n}\n''')
+
+          tests = Path("test/whatsappCharacterization.test.js")
+          test_source = tests.read_text()
+          test_source = test_source.replace(
+              'import { createPatchedWhatsappHarness } from "./helpers/createPatchedWhatsappHarness.js";',
+              'import { createCurrentWhatsappHarness } from "./helpers/createCurrentWhatsappHarness.js";'
+          )
+          test_source = test_source.replace(
+              'const harness = await createPatchedWhatsappHarness();',
+              'const harness = await createCurrentWhatsappHarness();'
+          )
+          if 'createPatchedWhatsappHarness' in test_source:
+              raise SystemExit("legacy harness still used by behavior characterization tests")
+          tests.write_text(test_source)
+          PY
+      - run: npm ci
+      - run: npm test
+      - run: npm run check
+      - name: Commit current-source harness
+        run: |
+          git config user.name "TravelsPlatform"
+          git config user.email "152078198+tp-management@users.noreply.github.com"
+          git add test/helpers/createWhatsappHarness.js test/helpers/createPatchedWhatsappHarness.js test/helpers/createCurrentWhatsappHarness.js test/whatsappCharacterization.test.js
+          git diff --cached --check
+          git commit -m "test: add current WhatsApp source harness"
+          git push --force origin HEAD:refs/heads/generated/whatsapp-current-harness
