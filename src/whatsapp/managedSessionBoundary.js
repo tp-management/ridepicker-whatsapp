@@ -1,6 +1,7 @@
 import { repository } from "../repository.js";
 import { writeSystemLog } from "../systemLog.js";
 import {
+  disconnectSession,
   getManagedSession,
   getSession,
   startSession,
@@ -28,6 +29,7 @@ function httpError(status, message, details = null) {
 
 export function createManagedSessionBoundary({
   repository: repositoryAdapter,
+  disconnectSession: disconnectSessionAdapter,
   getManagedSession: getManagedSessionAdapter,
   getSession: getSessionAdapter,
   startSession: startSessionAdapter,
@@ -91,6 +93,21 @@ export function createManagedSessionBoundary({
     }
   }
 
+  async function removeLocalRuntimeAndAuth(dbSession, runtimeSession, reason) {
+    if (runtimeSession) {
+      // disconnectSession(false) normally tries socket.logout() best-effort.
+      // Null the socket first so this cleanup is provably local-only, while
+      // still letting the canonical session registry remove the runtime entry.
+      stopRuntimeLocally(runtimeSession, reason);
+      await disconnectSessionAdapter(dbSession.id, {
+        requestRemoteLogout: false,
+      });
+      return;
+    }
+
+    await clearSupabaseAuthStateAdapter(dbSession.id);
+  }
+
   async function updateDb(dbSession, patch) {
     const updated = await repositoryAdapter.updateWhatsappSessionById(
       dbSession.id,
@@ -102,22 +119,20 @@ export function createManagedSessionBoundary({
 
   async function cleanupKnownLoggedOut(dbSession) {
     const runtimeSession = getSessionAdapter(dbSession.id) || null;
-    if (runtimeSession) {
-      stopRuntimeLocally(runtimeSession, "Cleaning already logged-out session");
-    }
-
-    if (await hasSupabaseAuthStateAdapter(dbSession.id)) {
-      await clearSupabaseAuthStateAdapter(dbSession.id);
-    }
-
+    await removeLocalRuntimeAndAuth(
+      dbSession,
+      runtimeSession,
+      "Cleaning already logged-out session"
+    );
     return dbSession;
   }
 
   async function cleanupUnregisteredResidue(dbSession, runtimeSession) {
-    if (runtimeSession) {
-      stopRuntimeLocally(runtimeSession, "Cleaning unregistered pairing residue");
-    }
-    await clearSupabaseAuthStateAdapter(dbSession.id);
+    await removeLocalRuntimeAndAuth(
+      dbSession,
+      runtimeSession,
+      "Cleaning unregistered pairing residue"
+    );
     return dbSession;
   }
 
@@ -168,8 +183,11 @@ export function createManagedSessionBoundary({
     // Explicit remote logout succeeded. Only now is it safe to mark LOGGED_OUT,
     // which also activates the database auth-purge guard.
     const updated = await updateLoggedOutState(dbSession);
-    stopRuntimeLocally(runtimeSession, "Remote WhatsApp logout completed");
-    await clearSupabaseAuthStateAdapter(dbSession.id);
+    await removeLocalRuntimeAndAuth(
+      dbSession,
+      runtimeSession,
+      "Remote WhatsApp logout completed"
+    );
 
     if (recordActivity) {
       await bestEffortActivity(userId, {
@@ -405,6 +423,7 @@ export function createManagedSessionBoundary({
 
 const boundary = createManagedSessionBoundary({
   repository,
+  disconnectSession,
   getManagedSession,
   getSession,
   startSession,
