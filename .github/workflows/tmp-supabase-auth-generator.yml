@@ -1,0 +1,34 @@
+name: Temporary Supabase auth generator
+
+on:
+  push:
+    branches:
+      - tmp/supabase-auth-generator
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/supabase-auth-generator
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: node scripts/generate-supabase-auth-migration.mjs
+      - run: npm test
+      - run: npm run check
+      - name: Commit generated source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "refactor: persist WhatsApp auth in Supabase"
+          git push origin HEAD:tmp/supabase-auth-generator
