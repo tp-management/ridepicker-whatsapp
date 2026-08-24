@@ -58,22 +58,24 @@ test("database trigger strictly skips unmatched rows regardless of message direc
   assert.match(strictSql, /RETURN NULL/i);
 });
 
-test("minimum price filter rejects only explicit GBP amounts below the saved floor", async () => {
+test("minimum price detection scans numeric values without requiring price keywords", async () => {
   const priceSql = await fs.readFile(
-    "supabase/migrations/20260825_add_assist_minimum_price_filter.sql",
+    "supabase/migrations/20260825_assist_price_any_numeric_value.sql",
     "utf8"
   );
 
   assert.match(priceSql, /dp\.minimum_job_price/i);
   assert.match(priceSql, /minimum_job_price IS NULL OR minimum_job_price <= 0/i);
-  assert.match(priceSql, /\(\?:£\|GBP\).*\(\[0-9\]\+/i);
-  assert.match(priceSql, /\[0-9\]\+.*\(\?:£\|GBP\)/i);
-  assert.match(priceSql, /price_value >= minimum_job_price/i);
-  assert.match(priceSql, /IF explicit_price_found THEN\s+RETURN NULL/i);
-  assert.match(priceSql, /Unknown\/missing prices still reach AI/i);
+  assert.match(priceSql, /regexp_matches\([\s\S]*\[0-9\]\+/i);
+  assert.match(priceSql, /number_value >= minimum_job_price/i);
+  assert.match(priceSql, /numeric_value_found/i);
+  assert.match(priceSql, /No fare\/net\/GBP\/£ keyword is\s+required/i);
+  assert.match(priceSql, /[0-9]\{1,2\}\[\/-\]\[0-9\]\{1,2\}/i);
+  assert.match(priceSql, /[0-2]\?\[0-9\]:\[0-5\]\[0-9\]/i);
+  assert.match(priceSql, /BETWEEN 1900 AND 2100/i);
 
-  // Price filtering is a messages BEFORE INSERT concern only. It must never
-  // mutate durable WhatsApp session/auth state or perform remote logout work.
+  // Price filtering stays inside the messages BEFORE INSERT concern only.
+  // It must never mutate durable WhatsApp session/auth state or perform logout.
   assert.doesNotMatch(
     priceSql,
     /\b(?:UPDATE|DELETE|INSERT INTO)\s+public\.whatsapp_(?:sessions|auth)\b/i
