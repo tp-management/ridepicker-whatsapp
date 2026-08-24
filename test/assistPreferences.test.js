@@ -70,8 +70,10 @@ test("minimum price detection scans numeric values without requiring price keywo
   assert.match(priceSql, /number_value >= minimum_job_price/i);
   assert.match(priceSql, /numeric_value_found/i);
   assert.match(priceSql, /No fare\/net\/GBP\/£ keyword is[\s\S]*required for a number/i);
-  assert.match(priceSql, /[0-9]\{1,2\}\[\/-\]\[0-9\]\{1,2\}/i);
-  assert.match(priceSql, /[0-2]\?\[0-9\]:\[0-5\]\[0-9\]/i);
+  assert.ok(
+    priceSql.includes("'[0-9]{1,2}[/-][0-9]{1,2}(?:[/-][0-9]{2,4})?'")
+  );
+  assert.ok(priceSql.includes("'[0-2]?[0-9]:[0-5][0-9]'"));
   assert.match(priceSql, /BETWEEN 1900 AND 2100/i);
 
   // Price filtering stays inside the messages BEFORE INSERT concern only.
