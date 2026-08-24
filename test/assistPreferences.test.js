@@ -58,6 +58,29 @@ test("database trigger strictly skips unmatched rows regardless of message direc
   assert.match(strictSql, /RETURN NULL/i);
 });
 
+test("minimum price filter rejects only explicit GBP amounts below the saved floor", async () => {
+  const priceSql = await fs.readFile(
+    "supabase/migrations/20260825_add_assist_minimum_price_filter.sql",
+    "utf8"
+  );
+
+  assert.match(priceSql, /dp\.minimum_job_price/i);
+  assert.match(priceSql, /minimum_job_price IS NULL OR minimum_job_price <= 0/i);
+  assert.match(priceSql, /\(\?:£\|GBP\).*\(\[0-9\]\+/i);
+  assert.match(priceSql, /\[0-9\]\+.*\(\?:£\|GBP\)/i);
+  assert.match(priceSql, /price_value >= minimum_job_price/i);
+  assert.match(priceSql, /IF explicit_price_found THEN\s+RETURN NULL/i);
+  assert.match(priceSql, /Unknown\/missing prices still reach AI/i);
+
+  // Price filtering is a messages BEFORE INSERT concern only. It must never
+  // mutate durable WhatsApp session/auth state or perform remote logout work.
+  assert.doesNotMatch(
+    priceSql,
+    /\b(?:UPDATE|DELETE|INSERT INTO)\s+public\.whatsapp_(?:sessions|auth)\b/i
+  );
+  assert.doesNotMatch(priceSql, /\.logout\s*\(/i);
+});
+
 test("Assist preferences API only allows writes while WhatsApp is connected", async () => {
   const source = await fs.readFile("src/assistPreferencesRoutes.js", "utf8");
   assert.match(source, /session\.status !== "CONNECTED"/);
