@@ -85,6 +85,29 @@ test("minimum price detection scans numeric values without requiring price keywo
   assert.doesNotMatch(priceSql, /\.logout\s*\(/i);
 });
 
+test("vehicle preference filtering stays independent and WhatsApp-safe", async () => {
+  const vehicleSql = await fs.readFile(
+    "supabase/migrations/20260825_add_assist_vehicle_filter.sql",
+    "utf8"
+  );
+
+  assert.match(vehicleSql, /assistVehicleTypes/);
+  assert.match(vehicleSql, /assist_vehicle_types \? 'saloon'/i);
+  assert.match(vehicleSql, /assist_vehicle_types \? 'estate'/i);
+  assert.match(vehicleSql, /assist_vehicle_types \? 'mpv'/i);
+  assert.match(vehicleSql, /assist_vehicle_types \? '8_seater'/i);
+  assert.match(vehicleSql, /recognized_vehicle AND NOT selected_vehicle_matches/i);
+  assert.match(vehicleSql, /minimum_job_price/i);
+  assert.match(vehicleSql, /position\(normalized_keyword IN normalized_body\) > 0/i);
+
+  // Database-only filtering must never touch linked-device auth/session state.
+  assert.doesNotMatch(
+    vehicleSql,
+    /\b(?:UPDATE|DELETE|INSERT INTO)\s+public\.whatsapp_(?:sessions|auth)\b/i
+  );
+  assert.doesNotMatch(vehicleSql, /\.logout\s*\(/i);
+});
+
 test("Assist preferences API only allows writes while WhatsApp is connected", async () => {
   const source = await fs.readFile("src/assistPreferencesRoutes.js", "utf8");
   assert.match(source, /session\.status !== "CONNECTED"/);
