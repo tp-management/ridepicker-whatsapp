@@ -108,6 +108,27 @@ test("vehicle preference filtering stays independent and WhatsApp-safe", async (
   assert.doesNotMatch(vehicleSql, /\.logout\s*\(/i);
 });
 
+test("active minimum price strictly rejects messages with no usable number", async () => {
+  const strictPriceSql = await fs.readFile(
+    "supabase/migrations/20260825_strict_assist_price_requires_numeric.sql",
+    "utf8"
+  );
+
+  assert.match(strictPriceSql, /minimum_job_price IS NOT NULL AND minimum_job_price > 0/i);
+  assert.match(strictPriceSql, /IF NOT numeric_value_found THEN\s+RETURN NULL;/i);
+  assert.match(strictPriceSql, /IF NOT price_matches THEN\s+RETURN NULL;/i);
+  assert.match(strictPriceSql, /number_value >= minimum_job_price/i);
+  assert.match(strictPriceSql, /assistVehicleTypes/);
+  assert.match(strictPriceSql, /position\(normalized_keyword IN normalized_body\) > 0/i);
+
+  // Strict price filtering is still message-only and cannot disconnect users.
+  assert.doesNotMatch(
+    strictPriceSql,
+    /\b(?:UPDATE|DELETE|INSERT INTO)\s+public\.whatsapp_(?:sessions|auth)\b/i
+  );
+  assert.doesNotMatch(strictPriceSql, /\.logout\s*\(/i);
+});
+
 test("Assist preferences API only allows writes while WhatsApp is connected", async () => {
   const source = await fs.readFile("src/assistPreferencesRoutes.js", "utf8");
   assert.match(source, /session\.status !== "CONNECTED"/);
