@@ -28,10 +28,14 @@ function bodyShape(body) {
   return Object.keys(body).slice(0, 30).sort();
 }
 
+function isLongLivedPath(path) {
+  return /^\/api\/users\/[^/]+\/events\/?$/i.test(String(path || ""));
+}
+
 function requestLevel({ method, statusCode, durationMs, path }) {
   if (statusCode >= 500) return "error";
   if (statusCode >= 400) return "warning";
-  if (path !== "/api/live-events" && durationMs >= SLOW_REQUEST_MS) {
+  if (!isLongLivedPath(path) && durationMs >= SLOW_REQUEST_MS) {
     return "warning";
   }
   if (MUTATION_METHODS.has(method)) return "info";
@@ -40,6 +44,13 @@ function requestLevel({ method, statusCode, durationMs, path }) {
 
 function shouldSkip(path) {
   return path === "/health" || path === "/health/";
+}
+
+function elapsedMs(startedAt) {
+  return Math.max(
+    0,
+    Math.round(Number(process.hrtime.bigint() - startedAt) / 1_000_000)
+  );
 }
 
 function consoleRequestSummary(level, details) {
@@ -55,6 +66,7 @@ export function installRequestObservability(req, res, next) {
   const startedAt = process.hrtime.bigint();
   const path = safePath(req);
   let aborted = false;
+  let finished = false;
 
   req.requestId = requestId;
   res.setHeader("x-request-id", requestId);
@@ -72,6 +84,7 @@ export function installRequestObservability(req, res, next) {
         requestId,
         method: req.method,
         path,
+        durationMs: elapsedMs(startedAt),
         targetUserId: requestedUserId(path),
         bodyKeys: bodyShape(req.body),
         actionability: "attention",
@@ -80,13 +93,10 @@ export function installRequestObservability(req, res, next) {
   });
 
   res.once("finish", () => {
+    finished = true;
     if (shouldSkip(path)) return;
 
-    const durationMs = Math.max(
-      0,
-      Number(process.hrtime.bigint() - startedAt) / 1_000_000
-    );
-    const roundedDurationMs = Math.round(durationMs);
+    const roundedDurationMs = elapsedMs(startedAt);
     const level = requestLevel({
       method: req.method,
       statusCode: res.statusCode,
@@ -111,6 +121,26 @@ export function installRequestObservability(req, res, next) {
       event: "http_request_completed",
       message: `${req.method} ${path} -> ${res.statusCode}`,
       details,
+    });
+  });
+
+  res.once("close", () => {
+    if (finished || aborted || shouldSkip(path) || !isLongLivedPath(path)) return;
+
+    void writeSystemLog({
+      level: "debug",
+      source: "http",
+      event: "http_stream_closed",
+      message: "Long-lived HTTP stream closed",
+      details: {
+        requestId,
+        method: req.method,
+        path,
+        statusCode: res.statusCode,
+        durationMs: elapsedMs(startedAt),
+        targetUserId: requestedUserId(path),
+        actionability: "diagnostic",
+      },
     });
   });
 
@@ -141,6 +171,7 @@ export function logUnhandledHttpError(error, req) {
 
 export const __observability = {
   bodyShape,
+  isLongLivedPath,
   requestLevel,
   requestedUserId,
   safeRequestId,
