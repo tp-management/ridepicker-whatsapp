@@ -9,6 +9,10 @@ import liveEventsRouter, {
   installRepositoryLiveEvents,
   publishSuccessfulUserWrite,
 } from "./liveEvents.js";
+import {
+  installRequestObservability,
+  logUnhandledHttpError,
+} from "./observability.js";
 import userApiRouter from "./userApiRoutes.js";
 import managedDisconnectRouter from "./whatsapp/managedDisconnectRouter.js";
 import router from "./routes.js";
@@ -19,6 +23,11 @@ export function createApp() {
   const app = express();
 
   app.disable("x-powered-by");
+
+  // Install before CORS/body parsing so even rejected or malformed requests get
+  // a correlation id and a persistent completion/error record. Request bodies
+  // are never logged; only their top-level field names are retained.
+  app.use(installRequestObservability);
 
   app.use(
     cors({
@@ -67,11 +76,29 @@ export function createApp() {
   app.use(router);
 
   app.use((error, req, res, next) => {
-    if (error?.message === "Origin not allowed by CORS") {
-      return res.status(403).json({ error: error.message });
+    logUnhandledHttpError(error, req);
+
+    if (res.headersSent) {
+      return next(error);
     }
 
-    next(error);
+    if (error?.message === "Origin not allowed by CORS") {
+      return res.status(403).json({
+        error: error.message,
+        requestId: req.requestId || null,
+      });
+    }
+
+    const requestedStatus = Number(error?.status || error?.statusCode || 500);
+    const status =
+      requestedStatus >= 400 && requestedStatus <= 599
+        ? requestedStatus
+        : 500;
+
+    return res.status(status).json({
+      error: status >= 500 ? "Internal server error" : error?.message || "Request failed",
+      requestId: req.requestId || null,
+    });
   });
 
   return app;
