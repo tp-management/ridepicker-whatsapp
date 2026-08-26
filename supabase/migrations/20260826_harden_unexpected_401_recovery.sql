@@ -155,7 +155,7 @@ SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
-  v_cleared boolean;
+  v_rows integer;
 BEGIN
   UPDATE public.whatsapp_sessions
   SET
@@ -170,8 +170,8 @@ BEGIN
     AND connected_at = p_connected_at
     AND recovery_state <> 'idle';
 
-  GET DIAGNOSTICS v_cleared = ROW_COUNT;
-  RETURN v_cleared;
+  GET DIAGNOSTICS v_rows = ROW_COUNT;
+  RETURN v_rows > 0;
 END;
 $$;
 
