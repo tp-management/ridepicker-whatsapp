@@ -69,6 +69,21 @@ test("HTTP request levels preserve signal", () => {
     }),
     "warning"
   );
+  assert.equal(
+    __observability.isLongLivedPath(
+      "/api/users/339c3784-cd51-4eb0-b8b9-b561c01ba8bc/events"
+    ),
+    true
+  );
+  assert.equal(
+    __observability.requestLevel({
+      method: "GET",
+      statusCode: 200,
+      durationMs: 60_000,
+      path: "/api/users/339c3784-cd51-4eb0-b8b9-b561c01ba8bc/events",
+    }),
+    "debug"
+  );
 });
 
 test("persistent log sanitizer removes credentials and direct WhatsApp identifiers", () => {
@@ -92,10 +107,18 @@ test("persistent log sanitizer removes credentials and direct WhatsApp identifie
   assert.doesNotMatch(JSON.stringify(sanitized), /super-secret-token/);
 });
 
-test("actionability distinguishes expected n8n failure from real incidents", () => {
+test("actionability distinguishes expected failures, raw evidence, and real incidents", () => {
   assert.equal(
     __systemLog.classifyActionability("n8n", "n8n_failed", "error"),
     "expected"
+  );
+  assert.equal(
+    __systemLog.classifyActionability("baileys_raw", "log", "error"),
+    "attention"
+  );
+  assert.equal(
+    __systemLog.classifyActionability("baileys_raw", "log", "warning"),
+    "diagnostic"
   );
   assert.equal(
     __systemLog.classifyActionability(
