@@ -16,18 +16,25 @@ async function listJsFiles(root) {
   return result;
 }
 
-test("native socket.logout has exactly one production owner", async () => {
+function executableSource(source) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|\s)\/\/.*$/gm, "$1");
+}
+
+test("native socket.logout has exactly one awaited production owner", async () => {
   const files = await listJsFiles("src");
   const calls = [];
 
   for (const file of files) {
-    const source = await fs.readFile(file, "utf8");
-    const matches = source.match(/\b(?:[A-Za-z_$][\w$]*\.)*logout\s*\(\s*\)/g) || [];
+    const source = executableSource(await fs.readFile(file, "utf8"));
+    const matches =
+      source.match(/await\s+(?:[A-Za-z_$][\w$]*\.)*logout\s*\(\s*\)/g) || [];
     for (const match of matches) calls.push({ file, match });
   }
 
   assert.deepEqual(calls, [
-    { file: path.join("src", "whatsapp.js"), match: "socket.logout()" },
+    { file: path.join("src", "whatsapp.js"), match: "await socket.logout()" },
   ]);
 
   const whatsapp = await fs.readFile(path.join("src", "whatsapp.js"), "utf8");
