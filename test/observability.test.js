@@ -86,13 +86,17 @@ test("HTTP request levels preserve signal", () => {
   );
 });
 
-test("persistent log sanitizer removes credentials and direct WhatsApp identifiers", () => {
+test("persistent log sanitizer removes credentials and direct WhatsApp identifiers without damaging UUIDs", () => {
+  const requestId = "37386230-c038-49c6-b6cc-15758cb1d7ef";
+  const sessionId = "78ec971c-dce2-42c6-a982-2d70777d256b";
   const sanitized = __systemLog.sanitize({
     authorization: "Bearer super-secret-token",
     creds: { registered: true, key: "secret" },
     phone: "+37061234567",
     jid: "37061234567@s.whatsapp.net",
     url: "https://example.test/callback?token=abc123&ok=1",
+    requestId,
+    sessionId,
     nested: {
       message: "contact +37061234567 at 37061234567@s.whatsapp.net",
     },
@@ -102,6 +106,8 @@ test("persistent log sanitizer removes credentials and direct WhatsApp identifie
   assert.equal(sanitized.creds, "[redacted]");
   assert.equal(sanitized.phone, "[redacted-phone]");
   assert.equal(sanitized.jid, "[redacted-jid]");
+  assert.equal(sanitized.requestId, requestId);
+  assert.equal(sanitized.sessionId, sessionId);
   assert.match(sanitized.url, /token=\[redacted\]/);
   assert.doesNotMatch(JSON.stringify(sanitized), /37061234567/);
   assert.doesNotMatch(JSON.stringify(sanitized), /super-secret-token/);
