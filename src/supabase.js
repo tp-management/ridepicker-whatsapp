@@ -29,6 +29,24 @@ function buildUrl(path, query = {}) {
   return url;
 }
 
+function annotateSupabaseError(
+  error,
+  { method, path, phase, statusCode = null, durationMs = null }
+) {
+  if (!error || typeof error !== "object") return error;
+
+  error.upstream = {
+    service: "supabase",
+    method,
+    path,
+    phase,
+    statusCode,
+    durationMs,
+  };
+
+  return error;
+}
+
 export async function supabaseRequest(
   path,
   {
@@ -42,17 +60,35 @@ export async function supabaseRequest(
 ) {
   requireConfigured();
 
-  const response = await fetch(buildUrl(path, query), {
-    method,
-    headers: {
-      apikey: SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      ...(prefer ? { Prefer: prefer } : {}),
-      ...headers,
-    },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+  const startedAt = Date.now();
+  const url = buildUrl(path, query);
+  let response;
+
+  try {
+    response = await fetch(url, {
+      method,
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        ...(prefer ? { Prefer: prefer } : {}),
+        ...headers,
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (error) {
+    annotateSupabaseError(error, {
+      method,
+      path,
+      phase: "network",
+      durationMs: Date.now() - startedAt,
+    });
+    console.error(
+      `[supabase] ${method} ${path} failed before response:`,
+      error.message
+    );
+    throw error;
+  }
 
   const text = await response.text();
 
@@ -73,6 +109,16 @@ export async function supabaseRequest(
     error.status = response.status;
     error.code = details?.code || null;
     error.details = details;
+    annotateSupabaseError(error, {
+      method,
+      path,
+      phase: "response",
+      statusCode: response.status,
+      durationMs: Date.now() - startedAt,
+    });
+    console.error(
+      `[supabase] ${method} ${path} returned ${response.status}${error.code ? ` code=${error.code}` : ""}`
+    );
     throw error;
   }
 
@@ -84,7 +130,22 @@ export async function supabaseRequest(
     return null;
   }
 
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    annotateSupabaseError(error, {
+      method,
+      path,
+      phase: "decode",
+      statusCode: response.status,
+      durationMs: Date.now() - startedAt,
+    });
+    console.error(
+      `[supabase] ${method} ${path} returned invalid JSON:`,
+      error.message
+    );
+    throw error;
+  }
 }
 
 export async function callRpc(functionName, body = {}) {
@@ -139,3 +200,7 @@ export async function deleteRows(table, query = {}) {
     })) || []
   );
 }
+
+export const __supabaseDiagnostics = {
+  annotateSupabaseError,
+};
