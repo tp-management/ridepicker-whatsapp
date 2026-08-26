@@ -270,12 +270,22 @@ export function createManagedSessionBoundary({
         );
       }
 
+      // Mark local intent before Baileys emits its 401-style close event.
+      // The connection handler will then defer all irreversible cleanup to this
+      // explicit caller, which finalizes only after logout() resolves.
+      runtimeSession.logoutRequested = true;
+      runtimeSession.logoutRequestedAt = new Date().toISOString();
       await runtimeSession.socket.logout();
       return finalizeSuccessfulLogout(dbSession, userId, runtimeSession, {
         reason,
         recordActivity,
       });
     } catch (error) {
+      if (runtimeSession) {
+        runtimeSession.logoutRequested = false;
+        runtimeSession.logoutRequestedAt = null;
+      }
+
       if (startedRuntimeForLogout) {
         await updateDb(dbSession, {
           status: dbSession.status,

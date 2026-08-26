@@ -42,6 +42,7 @@ const managedPairingFlows = new Map();
 const groupNameCache = new Map();
 const policyCache = new Map();
 const chatWriteCache = new Map();
+const unexpectedLogoutRecoveryAttempts = new Map();
 
 const GROUP_CACHE_TTL = 10 * 60 * 1000;
 const CHAT_WRITE_TTL = 10 * 60 * 1000;
@@ -80,6 +81,10 @@ const WA_PAIRING_UX_V1 = true;
 const WA_PAIRING_FEEDBACK_V1 = true;
 const BAILEYS_RAW_UI_ERRORS_V1 = true;
 const PAIRING_RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
+// Unsolicited 401s are ambiguous in Baileys v7. Retry them with the same
+// registered Supabase auth before asking the user to pair again. Never hammer
+// WhatsApp indefinitely if the companion really was removed.
+const UNEXPECTED_LOGOUT_RETRY_DELAYS_MS = [2_000, 10_000, 30_000];
 const WA_WEB_VERSION_CACHE_MS = 10 * 60 * 1000;
 
 let cachedWaWebVersion = null;
@@ -1064,9 +1069,24 @@ function disconnectDetails(lastDisconnect) {
     error?.output?.payload?.message ||
     "WhatsApp connection closed";
 
+  // Baileys attaches the WhatsApp stream-error reason node to Boom.data.
+  // Keep only the small classification fields we need for diagnostics. Never
+  // persist the full node because it may contain protocol/account metadata.
+  const reasonNode =
+    error?.data && typeof error.data === "object" ? error.data : null;
+  const reasonTag =
+    typeof reasonNode?.tag === "string" ? reasonNode.tag : null;
+  const conflictType =
+    reasonTag === "conflict" &&
+    typeof reasonNode?.attrs?.type === "string"
+      ? reasonNode.attrs.type
+      : null;
+
   return {
     statusCode,
     message,
+    reasonTag,
+    conflictType,
   };
 }
 
@@ -1536,9 +1556,14 @@ export async function startSession(
     status: "STARTING",
     registered: Boolean(state?.creds?.registered),
     openedOnce: false,
+    openedAtMs: null,
     passkeyRequired: false,
     reconnectTimer: null,
     lastError: null,
+    // This flag is set only by RidePicker immediately before socket.logout().
+    // A remote/unsolicited 401 must never be allowed to impersonate that intent.
+    logoutRequested: false,
+    logoutRequestedAt: null,
     disposed: false,
   };
 
@@ -1727,6 +1752,13 @@ export async function startSession(
 
     if (connection === "open") {
       clearReconnectTimer(session);
+      // Do not reset an unexpected-401 retry budget merely because a recovery
+      // socket reaches open for a moment. A conflict can recur immediately
+      // after open. The budget is reset lazily only after a genuinely stable
+      // connection window.
+      session.openedAtMs = Date.now();
+      session.logoutRequested = false;
+      session.logoutRequestedAt = null;
       session.openedOnce = true;
       session.passkeyRequired = false;
 
@@ -1807,13 +1839,17 @@ export async function startSession(
     }
 
     if (connection === "close") {
-      const { statusCode, message } = disconnectDetails(lastDisconnect);
+      const { statusCode, message, reasonTag, conflictType } =
+        disconnectDetails(lastDisconnect);
 
       console.warn(
         `[${id}] WhatsApp connection closed`,
         JSON.stringify({
           statusCode,
           message,
+          reasonTag,
+          conflictType,
+          locallyRequestedLogout: Boolean(session.logoutRequested),
           registered: session.registered,
           pairingAttemptActive: session.pairingAttemptActive,
         })
@@ -1826,6 +1862,9 @@ export async function startSession(
         message,
         {
           statusCode,
+          reasonTag,
+          conflictType,
+          locallyRequestedLogout: Boolean(session.logoutRequested),
           registered: session.registered,
           pairingAttemptActive: session.pairingAttemptActive,
         }
@@ -1842,6 +1881,26 @@ export async function startSession(
       session.registered = Boolean(
         session.registered || state?.creds?.registered
       );
+
+      // socket.logout() produces a 401-style close too. The explicit caller
+      // owns the destructive transition and only finalizes LOGGED_OUT after
+      // socket.logout() resolves. Returning here prevents a race that could
+      // purge auth early and also prevents duplicate disconnect activity rows.
+      if (session.logoutRequested) {
+        clearReconnectTimer(session);
+        unexpectedLogoutRecoveryAttempts.delete(id);
+        session.lastError = null;
+
+        console.log(`[${id}] expected close during requested WhatsApp logout`);
+        logWhatsappEvent(
+          session,
+          "info",
+          "whatsapp_logout_transport_closed",
+          "WhatsApp transport closed during a requested logout",
+          { statusCode, reasonTag, conflictType }
+        );
+        return;
+      }
 
       const restartRequired =
         statusCode === DisconnectReason.restartRequired;
@@ -1989,42 +2048,126 @@ export async function startSession(
         return;
       }
 
-      // Only a non-pairing 401 is a genuine WhatsApp logout.
+      // An unsolicited 401 is NOT sufficient proof of a terminal logout.
+      // Baileys v7 can surface transient conflict/device_removed stream errors
+      // for a previously healthy companion. Preserve registered Supabase auth
+      // and make a few bounded recovery attempts. If WhatsApp really removed
+      // the device, stop in ERROR with auth preserved so only an explicit user
+      // re-pair can replace it.
       if (statusCode === DisconnectReason.loggedOut) {
-        stopManagedPairingFlow(id);
-        clearReconnectTimer(session);
-        session.status = "LOGGED_OUT";
-        session.qr = null;
-        session.pairingCode = null;
-        session.pairingCodeIssuedAt = null;
-        session.pairingPhone = null;
-        session.pairingAttemptActive = false;
+        const stableOpen =
+          Number.isFinite(session.openedAtMs) &&
+          Date.now() - session.openedAtMs >= 60_000;
 
-        console.log(`[${id}] WhatsApp logged out`);
+        if (stableOpen) {
+          unexpectedLogoutRecoveryAttempts.delete(id);
+        }
+
+        const attempt =
+          (unexpectedLogoutRecoveryAttempts.get(id) || 0) + 1;
+        unexpectedLogoutRecoveryAttempts.set(id, attempt);
+
+        if (attempt > UNEXPECTED_LOGOUT_RETRY_DELAYS_MS.length) {
+          clearReconnectTimer(session);
+          session.status = "ERROR";
+          session.lastError = {
+            code: "UNEXPECTED_401_RECOVERY_EXHAUSTED",
+            message,
+          };
+
+          console.error(
+            `[${id}] unexpected WhatsApp 401 recovery exhausted; preserving auth`
+          );
+          logWhatsappEvent(
+            session,
+            "error",
+            "unexpected_401_recovery_exhausted",
+            message,
+            {
+              statusCode,
+              reasonTag,
+              conflictType,
+              attempts: attempt - 1,
+              authPreserved: true,
+            }
+          );
+
+          await persistSessionState(session, {
+            status: "ERROR",
+          });
+
+          dropSocketSession(session, {
+            removeAuth: false,
+            reason: "Unexpected WhatsApp 401 recovery exhausted",
+          });
+          return;
+        }
+
+        const delayMs = UNEXPECTED_LOGOUT_RETRY_DELAYS_MS[attempt - 1];
+        session.status = "RECONNECTING";
+
+        console.warn(
+          `[${id}] unexpected WhatsApp 401; preserving auth and retrying in ${delayMs}ms`
+        );
         logWhatsappEvent(
           session,
-          "info",
-          "whatsapp_logged_out",
-          "WhatsApp logged out",
-          { statusCode }
+          "warning",
+          "unexpected_401_recovery_started",
+          message,
+          {
+            statusCode,
+            reasonTag,
+            conflictType,
+            attempt,
+            delayMs,
+            authPreserved: true,
+          }
         );
 
+        // Do not touch bot_mode, account identity, connected_at, or auth here.
         await persistSessionState(session, {
-          status: "LOGGED_OUT",
-          bot_mode: "off",
-          whatsapp_phone: null,
-          display_name: null,
-          connected_at: null,
+          status: "RECONNECTING",
         });
 
-        await addSessionActivity(session, "WhatsApp disconnected", "");
-
         await forwardSessionEvent({
-          event: "session.logged_out",
+          event: "session.reconnecting",
           session: id,
           userId: session.userId,
           timestamp: Date.now(),
         });
+
+        if (!session.reconnectTimer) {
+          session.reconnectTimer = setTimeout(async () => {
+            session.reconnectTimer = null;
+
+            if (!isCurrentSession(session)) return;
+
+            const userId = session.userId;
+            dropSocketSession(session, {
+              removeAuth: false,
+              reason: "Recovering from unexpected WhatsApp 401",
+            });
+
+            try {
+              await startSession(id, { userId });
+            } catch (error) {
+              console.error(`[${id}] unexpected 401 recovery failed:`, error);
+              void writeSystemLog({
+                userId,
+                sessionId: id,
+                level: "error",
+                source: "whatsapp",
+                event: "unexpected_401_recovery_start_failed",
+                message: error.message,
+                details: { authPreserved: true },
+              });
+
+              await repository.updateWhatsappSessionById(id, {
+                status: "ERROR",
+              });
+            }
+          }, delayMs);
+        }
 
         return;
       }
@@ -2522,6 +2665,9 @@ export async function disconnectSession(
         throw error;
       }
 
+      session.logoutRequested = true;
+      session.logoutRequestedAt = new Date().toISOString();
+
       try {
         // Match Baileys' own logout semantics exactly. Baileys sends
         // remove-companion-device with sendNode() and then ends the socket.
@@ -2529,6 +2675,8 @@ export async function disconnectSession(
         // WhatsApp returned an IQ acknowledgement. Do not claim remote ACK.
         await session.socket.logout();
       } catch (error) {
+        session.logoutRequested = false;
+        session.logoutRequestedAt = null;
         console.warn(`[${sessionId}] logout failed:`, error.message);
         if (!error.status) {
           error.status = 502;
@@ -2543,6 +2691,8 @@ export async function disconnectSession(
 
     try {
       if (session.socket) {
+        session.logoutRequested = true;
+        session.logoutRequestedAt = new Date().toISOString();
         await session.socket.logout();
       }
     } catch (error) {
