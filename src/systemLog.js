@@ -154,6 +154,10 @@ function classifyActionability(source, event, level) {
     return "actionable";
   }
 
+  if (source === "baileys_raw" || source === "whatsapp_raw") {
+    return level === "error" ? "attention" : "diagnostic";
+  }
+
   if (level === "error") return "actionable";
   if (level === "warning") return "attention";
   return "diagnostic";
@@ -180,8 +184,8 @@ function withProvenance(source, event, level, details) {
     actionability:
       base.actionability || classifyActionability(source, event, level),
     runtime: {
-      ...runtimeContext(),
       ...(base.runtime && typeof base.runtime === "object" ? base.runtime : {}),
+      ...runtimeContext(),
     },
     ...(source === "n8n" && event === "n8n_failed"
       ? { expectedByDesign: true }
