@@ -6,6 +6,7 @@ on:
       - fix/durable-whatsapp-401-recovery
     paths:
       - scripts/apply-durable-whatsapp-401-recovery.mjs
+      - scripts/run-durable-whatsapp-401-recovery.mjs
       - .github/workflows/apply-durable-whatsapp-401-recovery.yml
 
 permissions:
@@ -28,7 +29,7 @@ jobs:
           cache: npm
 
       - name: Apply guarded source patch
-        run: node scripts/apply-durable-whatsapp-401-recovery.mjs
+        run: node scripts/run-durable-whatsapp-401-recovery.mjs
 
       - name: Install dependencies
         run: npm ci
