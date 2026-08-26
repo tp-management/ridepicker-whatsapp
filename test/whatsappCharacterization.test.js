@@ -42,7 +42,9 @@ function clearRuntimeTimers(whatsapp) {
 
   for (const session of sessions.values()) {
     if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
+    if (session.recoveryStableTimer) clearTimeout(session.recoveryStableTimer);
     session.reconnectTimer = null;
+    session.recoveryStableTimer = null;
   }
 }
 

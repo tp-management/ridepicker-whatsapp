@@ -4,6 +4,7 @@ import {
   disconnectSession,
   getManagedSession,
   getSession,
+  requestRemoteLogoutForSession,
   startSession,
   updatePolicyCache,
 } from "../whatsapp.js";
@@ -39,6 +40,8 @@ export function createManagedSessionBoundary({
   getManagedSession: getManagedSessionAdapter,
   getSession: getSessionAdapter,
   startSession: startSessionAdapter,
+  requestRemoteLogoutForSession: requestRemoteLogoutForSessionAdapter =
+    requestRemoteLogoutForSession,
   updatePolicyCache: updatePolicyCacheAdapter = () => {},
   hasSupabaseAuthState: hasSupabaseAuthStateAdapter,
   loadSupabaseAuthState: loadSupabaseAuthStateAdapter,
@@ -177,6 +180,12 @@ export function createManagedSessionBoundary({
       whatsapp_phone: null,
       display_name: null,
       connected_at: null,
+      recovery_state: "idle",
+      recovery_attempt_count: 0,
+      recovery_incident_started_at: null,
+      recovery_last_event_at: null,
+      recovery_reason_tag: null,
+      recovery_conflict_type: null,
     });
   }
 
@@ -270,22 +279,14 @@ export function createManagedSessionBoundary({
         );
       }
 
-      // Mark local intent before Baileys emits its 401-style close event.
-      // The connection handler will then defer all irreversible cleanup to this
-      // explicit caller, which finalizes only after logout() resolves.
-      runtimeSession.logoutRequested = true;
-      runtimeSession.logoutRequestedAt = new Date().toISOString();
-      await runtimeSession.socket.logout();
+      // Centralized helper marks intent before Baileys can emit its
+      // 401-style close. No other production call site owns this flag.
+      await requestRemoteLogoutForSessionAdapter(runtimeSession);
       return finalizeSuccessfulLogout(dbSession, userId, runtimeSession, {
         reason,
         recordActivity,
       });
     } catch (error) {
-      if (runtimeSession) {
-        runtimeSession.logoutRequested = false;
-        runtimeSession.logoutRequestedAt = null;
-      }
-
       if (startedRuntimeForLogout) {
         await updateDb(dbSession, {
           status: dbSession.status,
@@ -322,6 +323,12 @@ export function createManagedSessionBoundary({
     // local residue cleanup.
     if (dbSession.status === "LOGGED_OUT") {
       return cleanupKnownLoggedOut(dbSession);
+    }
+
+    if (dbSession.recovery_state === "relink_required") {
+      // Ordinary GET/POST reconciliation must not revive credentials that the
+      // bounded recovery state has already quarantined for explicit relinking.
+      return dbSession;
     }
 
     if (["CONNECTED", "RECONNECTING"].includes(dbSession.status)) {
