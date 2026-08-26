@@ -75,19 +75,22 @@ export function installRequestObservability(req, res, next) {
     aborted = true;
     if (shouldSkip(path)) return;
 
+    const streamAbort = isLongLivedPath(path);
     void writeSystemLog({
-      level: "warning",
+      level: streamAbort ? "debug" : "warning",
       source: "http",
-      event: "http_request_aborted",
-      message: "HTTP request aborted before completion",
+      event: streamAbort ? "http_stream_aborted" : "http_request_aborted",
+      message: streamAbort
+        ? "Long-lived HTTP stream closed by client"
+        : "HTTP request aborted before completion",
       details: {
         requestId,
         method: req.method,
         path,
         durationMs: elapsedMs(startedAt),
         targetUserId: requestedUserId(path),
-        bodyKeys: bodyShape(req.body),
-        actionability: "attention",
+        bodyKeys: streamAbort ? [] : bodyShape(req.body),
+        actionability: streamAbort ? "diagnostic" : "attention",
       },
     });
   });
