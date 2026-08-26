@@ -31,8 +31,11 @@ const REDACTED_KEYS = new Set([
 
 const WHATSAPP_JID_PATTERN =
   /(?:[a-z0-9._+-]+|\d+(?::\d+)?)@(?:s\.whatsapp\.net|lid|c\.us|g\.us|broadcast|newsletter)/gi;
+// Phone redaction deliberately refuses to start/end inside a hex/hyphen token.
+// This keeps UUID request/session/deployment correlation ids intact while still
+// redacting standalone phone numbers such as +37061234567 or 370 612 34567.
 const PHONE_IDENTIFIER_PATTERN =
-  /(?<![\w@])\+?\d(?:[\s().-]*\d){6,14}(?![\w@])/g;
+  /(?<![A-Fa-f0-9@-])\+?\d(?:[\s().-]*\d){6,14}(?![A-Fa-f0-9@-])/g;
 const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
 const SENSITIVE_QUERY_PATTERN =
   /([?&](?:token|access_token|refresh_token|secret|apikey|api_key)=)[^&#\s]+/gi;
