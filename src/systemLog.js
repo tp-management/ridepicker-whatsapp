@@ -76,6 +76,10 @@ function sanitize(value, depth = 0) {
         value?.output?.statusCode ||
         value?.output?.payload?.statusCode ||
         null,
+      upstream:
+        value.upstream && typeof value.upstream === "object"
+          ? sanitize(value.upstream, depth + 1)
+          : null,
       stack: value.stack ? safeString(value.stack, 3000) : null,
     };
   }
