@@ -5,6 +5,7 @@ import {
 } from "@whiskeysockets/baileys";
 
 import { supabaseRequest } from "../../supabase.js";
+import { writeSystemLog } from "../../systemLog.js";
 
 export const SUPABASE_AUTH_TYPE = "baileys_supabase_v1";
 const CREDS_KEY = "creds";
@@ -19,6 +20,23 @@ function deserialize(value) {
 
 function signalKey(type, id) {
   return `${type}:${id}`;
+}
+
+function logAuthEvent(
+  sessionId,
+  level,
+  event,
+  message,
+  details = {}
+) {
+  void writeSystemLog({
+    sessionId,
+    level,
+    source: "whatsapp_auth",
+    event,
+    message,
+    details,
+  });
 }
 
 export function createSupabaseAuthStore({ request = supabaseRequest } = {}) {
@@ -60,53 +78,169 @@ export function createSupabaseAuthStore({ request = supabaseRequest } = {}) {
   async function writeEntries(sessionId, entries) {
     if (!entries.length) return;
 
-    await enqueue(sessionId, () =>
-      request("rpc/ridepicker_whatsapp_auth_write", {
-        method: "POST",
-        body: {
-          p_session_id: sessionId,
-          p_auth_type: SUPABASE_AUTH_TYPE,
-          p_entries: entries,
-        },
-      })
-    );
+    try {
+      await enqueue(sessionId, () =>
+        request("rpc/ridepicker_whatsapp_auth_write", {
+          method: "POST",
+          body: {
+            p_session_id: sessionId,
+            p_auth_type: SUPABASE_AUTH_TYPE,
+            p_entries: entries,
+          },
+        })
+      );
+    } catch (error) {
+      logAuthEvent(
+        sessionId,
+        "error",
+        "whatsapp_auth_write_failed",
+        error.message,
+        {
+          entryCount: entries.length,
+          containsCreds: entries.some((entry) => entry?.auth_key === CREDS_KEY),
+          error,
+          actionability: "actionable",
+        }
+      );
+      throw error;
+    }
   }
 
   async function clear(sessionId) {
-    await enqueue(sessionId, () =>
-      request("rpc/ridepicker_whatsapp_auth_clear", {
-        method: "POST",
-        body: {
-          p_session_id: sessionId,
-          p_auth_type: SUPABASE_AUTH_TYPE,
-        },
-      })
+    logAuthEvent(
+      sessionId,
+      "info",
+      "whatsapp_auth_clear_started",
+      "WhatsApp auth clear requested",
+      { destructive: true, clearMode: "standard" }
     );
+
+    try {
+      await enqueue(sessionId, () =>
+        request("rpc/ridepicker_whatsapp_auth_clear", {
+          method: "POST",
+          body: {
+            p_session_id: sessionId,
+            p_auth_type: SUPABASE_AUTH_TYPE,
+          },
+        })
+      );
+
+      logAuthEvent(
+        sessionId,
+        "info",
+        "whatsapp_auth_clear_completed",
+        "WhatsApp auth clear completed",
+        { destructive: true, clearMode: "standard" }
+      );
+    } catch (error) {
+      logAuthEvent(
+        sessionId,
+        "error",
+        "whatsapp_auth_clear_failed",
+        error.message,
+        {
+          destructive: true,
+          clearMode: "standard",
+          error,
+          actionability: "actionable",
+        }
+      );
+      throw error;
+    }
   }
 
   async function clearForRelink(sessionId) {
-    await enqueue(sessionId, () =>
-      request("rpc/ridepicker_whatsapp_auth_prepare_relink", {
-        method: "POST",
-        body: {
-          p_session_id: sessionId,
-          p_auth_type: SUPABASE_AUTH_TYPE,
-        },
-      })
+    logAuthEvent(
+      sessionId,
+      "info",
+      "whatsapp_auth_relink_clear_started",
+      "Old WhatsApp auth clear started for explicit relink",
+      {
+        destructive: true,
+        clearMode: "explicit_relink",
+        actionability: "diagnostic",
+      }
     );
+
+    try {
+      await enqueue(sessionId, () =>
+        request("rpc/ridepicker_whatsapp_auth_prepare_relink", {
+          method: "POST",
+          body: {
+            p_session_id: sessionId,
+            p_auth_type: SUPABASE_AUTH_TYPE,
+          },
+        })
+      );
+
+      logAuthEvent(
+        sessionId,
+        "info",
+        "whatsapp_auth_relink_clear_completed",
+        "Old WhatsApp auth cleared for explicit relink",
+        {
+          destructive: true,
+          clearMode: "explicit_relink",
+          actionability: "diagnostic",
+        }
+      );
+    } catch (error) {
+      logAuthEvent(
+        sessionId,
+        "error",
+        "whatsapp_auth_relink_clear_failed",
+        error.message,
+        {
+          destructive: true,
+          clearMode: "explicit_relink",
+          error,
+          actionability: "actionable",
+        }
+      );
+      throw error;
+    }
   }
 
   async function has(sessionId) {
     const rows = await readRows(sessionId, [CREDS_KEY]);
-    return rows.some((row) => row?.auth_key === CREDS_KEY && row?.payload);
+    const hasCreds = rows.some(
+      (row) => row?.auth_key === CREDS_KEY && row?.payload
+    );
+
+    logAuthEvent(
+      sessionId,
+      "debug",
+      "whatsapp_auth_presence_checked",
+      "WhatsApp auth presence checked",
+      {
+        hasCreds,
+        rowCount: rows.length,
+      }
+    );
+
+    return hasCreds;
   }
 
   async function load(sessionId) {
     const rows = await readRows(sessionId, [CREDS_KEY]);
     const credsRow = rows.find((row) => row?.auth_key === CREDS_KEY);
-    const creds = credsRow?.payload
+    const hasStoredCreds = Boolean(credsRow?.payload);
+    const creds = hasStoredCreds
       ? deserialize(credsRow.payload)
       : initAuthCreds();
+
+    logAuthEvent(
+      sessionId,
+      "info",
+      "whatsapp_auth_loaded",
+      "WhatsApp auth state loaded",
+      {
+        hasStoredCreds,
+        registered: Boolean(creds?.registered),
+        rowCount: rows.length,
+      }
+    );
 
     return {
       state: {
