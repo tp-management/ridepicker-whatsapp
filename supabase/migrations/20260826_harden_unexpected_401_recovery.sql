@@ -175,6 +175,62 @@ BEGIN
 END;
 $$;
 
+-- A relink-required session may still contain registered credentials that the
+-- normal auth clear guard intentionally protects. Only an explicit new pairing
+-- flow may call this narrower RPC. It waits behind the auth-store mutation queue
+-- in Node, then atomically removes the obsolete auth and resets durable link
+-- metadata so a fresh pairing can start without a late-write resurrection.
+CREATE OR REPLACE FUNCTION public.ridepicker_whatsapp_auth_prepare_relink(
+  p_session_id uuid,
+  p_auth_type text DEFAULT 'baileys_supabase_v1'
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_status text;
+  v_recovery_state text;
+BEGIN
+  SELECT status, recovery_state
+  INTO v_status, v_recovery_state
+  FROM public.whatsapp_sessions
+  WHERE id = p_session_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'WhatsApp session not found'
+      USING ERRCODE = 'P0002';
+  END IF;
+
+  IF v_status <> 'ERROR' OR v_recovery_state <> 'relink_required' THEN
+    RAISE EXCEPTION 'WhatsApp session is not approved for explicit relink cleanup'
+      USING ERRCODE = '55000';
+  END IF;
+
+  DELETE FROM public.whatsapp_auth
+  WHERE session_id = p_session_id
+    AND auth_type = p_auth_type;
+
+  UPDATE public.whatsapp_sessions
+  SET
+    status = 'DISCONNECTED',
+    whatsapp_phone = NULL,
+    display_name = NULL,
+    connected_at = NULL,
+    recovery_state = 'idle',
+    recovery_attempt_count = 0,
+    recovery_incident_started_at = NULL,
+    recovery_last_event_at = NULL,
+    recovery_reason_tag = NULL,
+    recovery_conflict_type = NULL
+  WHERE id = p_session_id;
+
+  RETURN true;
+END;
+$$;
+
 REVOKE ALL ON FUNCTION public.register_whatsapp_unexpected_401(uuid, text, text, boolean)
   FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.register_whatsapp_unexpected_401(uuid, text, text, boolean)
@@ -183,4 +239,9 @@ GRANT EXECUTE ON FUNCTION public.register_whatsapp_unexpected_401(uuid, text, te
 REVOKE ALL ON FUNCTION public.mark_whatsapp_recovery_stable(uuid, timestamptz)
   FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.mark_whatsapp_recovery_stable(uuid, timestamptz)
+  TO service_role;
+
+REVOKE ALL ON FUNCTION public.ridepicker_whatsapp_auth_prepare_relink(uuid, text)
+  FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.ridepicker_whatsapp_auth_prepare_relink(uuid, text)
   TO service_role;
