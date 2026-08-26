@@ -351,6 +351,12 @@ test("unexpected 401 exhausts into ERROR without deleting registered auth", asyn
   row.bot_mode = "assist";
 
   for (let index = 0; index < 4; index += 1) {
+    // A recovery socket that only opens briefly must not reset the bounded
+    // retry budget. Otherwise conflict -> open -> conflict could loop forever.
+    if (index > 0) {
+      await socket.ev.emit("connection.update", { connection: "open" });
+    }
+
     const error = disconnectError(401, "Stream Errored (conflict)");
     error.data = { tag: "conflict", attrs: { type: "device_removed" } };
     await socket.ev.emit("connection.update", {

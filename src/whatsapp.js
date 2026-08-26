@@ -1556,6 +1556,7 @@ export async function startSession(
     status: "STARTING",
     registered: Boolean(state?.creds?.registered),
     openedOnce: false,
+    openedAtMs: null,
     passkeyRequired: false,
     reconnectTimer: null,
     lastError: null,
@@ -1751,7 +1752,11 @@ export async function startSession(
 
     if (connection === "open") {
       clearReconnectTimer(session);
-      unexpectedLogoutRecoveryAttempts.delete(id);
+      // Do not reset an unexpected-401 retry budget merely because a recovery
+      // socket reaches open for a moment. A conflict can recur immediately
+      // after open. The budget is reset lazily only after a genuinely stable
+      // connection window.
+      session.openedAtMs = Date.now();
       session.logoutRequested = false;
       session.logoutRequestedAt = null;
       session.openedOnce = true;
@@ -2050,6 +2055,14 @@ export async function startSession(
       // the device, stop in ERROR with auth preserved so only an explicit user
       // re-pair can replace it.
       if (statusCode === DisconnectReason.loggedOut) {
+        const stableOpen =
+          Number.isFinite(session.openedAtMs) &&
+          Date.now() - session.openedAtMs >= 60_000;
+
+        if (stableOpen) {
+          unexpectedLogoutRecoveryAttempts.delete(id);
+        }
+
         const attempt =
           (unexpectedLogoutRecoveryAttempts.get(id) || 0) + 1;
         unexpectedLogoutRecoveryAttempts.set(id, attempt);
