@@ -300,3 +300,107 @@ test("restore without Supabase auth records an infrastructure disconnect", async
     "expected restore disconnect to be visible in Activity"
   );
 });
+
+
+test("unexpected established 401 preserves auth and uses bounded recovery", async (t) => {
+  const harness = await useHarness(t);
+  const userId = "unexpected-401";
+  const row = await harness.repositoryStub.repository.ensureWhatsappSession(userId);
+  const session = await harness.whatsapp.startSession(row.id, { userId });
+  const socket = session.socket;
+
+  socket.authState.creds.registered = true;
+  socket.user = { id: "37061234567@s.whatsapp.net", name: "Test" };
+  await socket.ev.emit("creds.update", socket.authState.creds);
+  await socket.ev.emit("connection.update", { connection: "open" });
+
+  row.bot_mode = "assist";
+  const connectedAt = row.connected_at;
+  const error = disconnectError(401, "Stream Errored (conflict)");
+  error.data = { tag: "conflict", attrs: { type: "device_removed" } };
+
+  await socket.ev.emit("connection.update", {
+    connection: "close",
+    lastDisconnect: { error },
+  });
+
+  assert.equal(row.status, "RECONNECTING");
+  assert.equal(row.bot_mode, "assist");
+  assert.equal(row.connected_at, connectedAt);
+  assert.equal(socket.authState.creds.registered, true);
+  assert.ok(session.reconnectTimer, "expected a bounded recovery timer");
+  assert.equal(
+    harness.repositoryStub.__getActivities().filter(
+      (entry) => entry.title === "WhatsApp disconnected"
+    ).length,
+    0
+  );
+});
+
+test("unexpected 401 exhausts into ERROR without deleting registered auth", async (t) => {
+  const harness = await useHarness(t);
+  const userId = "unexpected-401-exhausted";
+  const row = await harness.repositoryStub.repository.ensureWhatsappSession(userId);
+  const session = await harness.whatsapp.startSession(row.id, { userId });
+  const socket = session.socket;
+
+  socket.authState.creds.registered = true;
+  socket.user = { id: "37061234567@s.whatsapp.net", name: "Test" };
+  await socket.ev.emit("creds.update", socket.authState.creds);
+  await socket.ev.emit("connection.update", { connection: "open" });
+  row.bot_mode = "assist";
+
+  for (let index = 0; index < 4; index += 1) {
+    const error = disconnectError(401, "Stream Errored (conflict)");
+    error.data = { tag: "conflict", attrs: { type: "device_removed" } };
+    await socket.ev.emit("connection.update", {
+      connection: "close",
+      lastDisconnect: { error },
+    });
+
+    if (session.reconnectTimer) {
+      clearTimeout(session.reconnectTimer);
+      session.reconnectTimer = null;
+    }
+  }
+
+  assert.equal(row.status, "ERROR");
+  assert.equal(row.bot_mode, "assist");
+  assert.equal(socket.authState.creds.registered, true);
+  assert.equal(harness.whatsapp.__characterization.sessions.has(row.id), false);
+  assert.equal(
+    harness.repositoryStub.__getActivities().filter(
+      (entry) => entry.title === "WhatsApp disconnected"
+    ).length,
+    0
+  );
+});
+
+test("locally requested logout close is finalized by the caller, not connection.update", async (t) => {
+  const harness = await useHarness(t);
+  const userId = "local-logout-owner";
+  const row = await harness.repositoryStub.repository.ensureWhatsappSession(userId);
+  const session = await harness.whatsapp.startSession(row.id, { userId });
+  const socket = session.socket;
+
+  socket.authState.creds.registered = true;
+  socket.user = { id: "37061234567@s.whatsapp.net", name: "Test" };
+  await socket.ev.emit("creds.update", socket.authState.creds);
+  await socket.ev.emit("connection.update", { connection: "open" });
+
+  session.logoutRequested = true;
+  session.logoutRequestedAt = new Date().toISOString();
+  await socket.ev.emit("connection.update", {
+    connection: "close",
+    lastDisconnect: { error: disconnectError(401, "Intentional Logout") },
+  });
+
+  assert.equal(row.status, "CONNECTED");
+  assert.equal(session.reconnectTimer, null);
+  assert.equal(
+    harness.repositoryStub.__getActivities().filter(
+      (entry) => entry.title === "WhatsApp disconnected"
+    ).length,
+    0
+  );
+});

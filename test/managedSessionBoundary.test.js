@@ -30,7 +30,7 @@ function createHarness({
     const socket = {
       user: runtimeRegistered ? { id: "37061234567@s.whatsapp.net" } : null,
       async logout() {
-        calls.push(["logout"]);
+        calls.push(["logout", runtime?.logoutRequested === true]);
         if (logoutError) throw logoutError;
       },
       end(error) {
@@ -257,6 +257,7 @@ test("explicit disconnect performs native logout before LOGGED_OUT and cleanup",
   const cleanup = indexOfCall(calls, "disconnectLocal");
 
   assert.ok(logout >= 0);
+  assert.equal(calls[logout][1], true, "logout intent must be marked before socket.logout");
   assert.ok(update > logout);
   assert.ok(cleanup > update);
   assert.equal(getDbSession().status, "LOGGED_OUT");
