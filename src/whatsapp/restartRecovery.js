@@ -76,6 +76,27 @@ export function createRestartRecovery({
       dbSession.connected_at || LINKED_DURABLE_STATUSES.has(dbSession.status)
     );
 
+    // relink_required is a durable quarantine, not a transient ERROR snapshot.
+    // Preserve the registered auth for explicit user relinking, but never revive
+    // it automatically after a process restart.
+    if (dbSession.recovery_state === "relink_required") {
+      await log({
+        userId,
+        sessionId: dbSession.id,
+        level: "warning",
+        source: "whatsapp",
+        event: "session_restore_relink_required",
+        message: "WhatsApp session requires an explicit new pairing code",
+        details: {
+          previousStatus: dbSession.status,
+          authExists: auth.exists,
+          authRegistered: auth.registered,
+          authPreserved: true,
+        },
+      });
+      return { sessionId: dbSession.id, action: "relink_required_auth_preserved" };
+    }
+
     // Registered Baileys credentials are stronger evidence than a transient DB
     // lifecycle value. STARTING/QR/ERROR/DISCONNECTED can all be snapshots left
     // behind when a process dies between durable writes. Never delete registered
@@ -261,6 +282,10 @@ export async function shutdownManagedSessions() {
     if (session.reconnectTimer) {
       clearTimeout(session.reconnectTimer);
       session.reconnectTimer = null;
+    }
+    if (session.recoveryStableTimer) {
+      clearTimeout(session.recoveryStableTimer);
+      session.recoveryStableTimer = null;
     }
 
     session.disposed = true;

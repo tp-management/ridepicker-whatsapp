@@ -1,4 +1,5 @@
 import {
+  callRpc,
   deleteRows,
   insertRows,
   selectRows,
@@ -372,6 +373,31 @@ export const repository = {
     );
 
     return first(rows);
+  },
+
+  async registerWhatsappUnexpected401(
+    sessionId,
+    { reasonTag = null, conflictType = null, terminalCandidate = false } = {}
+  ) {
+    const decision = await callRpc("register_whatsapp_unexpected_401", {
+      p_session_id: sessionId,
+      p_reason_tag: reasonTag,
+      p_conflict_type: conflictType,
+      p_terminal_candidate: Boolean(terminalCandidate),
+    });
+
+    const sessionRow = await this.getWhatsappSessionById(sessionId);
+    return { ...(decision || {}), sessionRow };
+  },
+
+  async markWhatsappRecoveryStable(sessionId, connectedAt) {
+    if (!connectedAt) return false;
+    return Boolean(
+      await callRpc("mark_whatsapp_recovery_stable", {
+        p_session_id: sessionId,
+        p_connected_at: connectedAt,
+      })
+    );
   },
 
   async getRidePickerState(userId) {

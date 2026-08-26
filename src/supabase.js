@@ -87,6 +87,13 @@ export async function supabaseRequest(
   return JSON.parse(text);
 }
 
+export async function callRpc(functionName, body = {}) {
+  return supabaseRequest(`rpc/${functionName}`, {
+    method: "POST",
+    body,
+  });
+}
+
 export function isSupabaseConfigured() {
   return SUPABASE_CONFIGURED;
 }

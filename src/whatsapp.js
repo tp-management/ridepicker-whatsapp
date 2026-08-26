@@ -25,6 +25,7 @@ import { writeSystemLog } from "./systemLog.js";
 import { createBaileysRawLogger } from "./whatsapp/logging/baileysLogger.js";
 import {
   clearSupabaseAuthState,
+  clearSupabaseAuthStateForRelink,
   hasSupabaseAuthState,
   loadSupabaseAuthState,
 } from "./whatsapp/auth/supabaseAuthStore.js";
@@ -42,7 +43,6 @@ const managedPairingFlows = new Map();
 const groupNameCache = new Map();
 const policyCache = new Map();
 const chatWriteCache = new Map();
-const unexpectedLogoutRecoveryAttempts = new Map();
 
 const GROUP_CACHE_TTL = 10 * 60 * 1000;
 const CHAT_WRITE_TTL = 10 * 60 * 1000;
@@ -81,10 +81,11 @@ const WA_PAIRING_UX_V1 = true;
 const WA_PAIRING_FEEDBACK_V1 = true;
 const BAILEYS_RAW_UI_ERRORS_V1 = true;
 const PAIRING_RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
-// Unsolicited 401s are ambiguous in Baileys v7. Retry them with the same
-// registered Supabase auth before asking the user to pair again. Never hammer
-// WhatsApp indefinitely if the companion really was removed.
-const UNEXPECTED_LOGOUT_RETRY_DELAYS_MS = [2_000, 10_000, 30_000];
+// A recovery incident is forgiven only after the replacement connection
+// proves useful. A real notify message is immediate proof; this continuous-open
+// timer is the quiet-account fallback. The durable retry budget itself lives in
+// Postgres, so this timer is never permission to delete credentials.
+const UNEXPECTED_401_STABLE_FALLBACK_MS = 5 * 60 * 1000;
 const WA_WEB_VERSION_CACHE_MS = 10 * 60 * 1000;
 
 let cachedWaWebVersion = null;
@@ -172,6 +173,88 @@ function clearReconnectTimer(session) {
     clearTimeout(session.reconnectTimer);
     session.reconnectTimer = null;
   }
+}
+
+function clearRecoveryStableTimer(session) {
+  if (session?.recoveryStableTimer) {
+    clearTimeout(session.recoveryStableTimer);
+    session.recoveryStableTimer = null;
+  }
+}
+
+async function markSessionRecoveryHealthy(
+  session,
+  { evidence = "stable_connection" } = {}
+) {
+  if (
+    !isCurrentSession(session) ||
+    session.recoveryHealthyMarked ||
+    session.recoveryHealthyMarkInFlight ||
+    !session.durableConnectedAt
+  ) {
+    return false;
+  }
+
+  session.recoveryHealthyMarkInFlight = true;
+
+  try {
+    const cleared = await repository.markWhatsappRecoveryStable(
+      session.id,
+      session.durableConnectedAt
+    );
+
+    if (!isCurrentSession(session)) return false;
+
+    session.recoveryHealthyMarked = true;
+    clearRecoveryStableTimer(session);
+
+    if (cleared) {
+      logWhatsappEvent(
+        session,
+        "info",
+        "unexpected_401_recovery_stable",
+        "WhatsApp recovery proved stable",
+        { evidence }
+      );
+    }
+
+    return true;
+  } catch (error) {
+    console.warn(
+      `[${session.id}] could not mark WhatsApp recovery stable:`,
+      error.message
+    );
+    logWhatsappEvent(
+      session,
+      "warning",
+      "unexpected_401_recovery_stable_write_failed",
+      error.message,
+      { evidence, authPreserved: true }
+    );
+    return false;
+  } finally {
+    session.recoveryHealthyMarkInFlight = false;
+  }
+}
+
+function scheduleRecoveryHealthyFallback(session) {
+  clearRecoveryStableTimer(session);
+
+  if (
+    !isCurrentSession(session) ||
+    session.recoveryHealthyMarked ||
+    !session.durableConnectedAt
+  ) {
+    return;
+  }
+
+  session.recoveryStableTimer = setTimeout(() => {
+    session.recoveryStableTimer = null;
+    if (!isCurrentSession(session) || session.status !== "CONNECTED") return;
+    void markSessionRecoveryHealthy(session, {
+      evidence: "continuous_open_5m",
+    });
+  }, UNEXPECTED_401_STABLE_FALLBACK_MS);
 }
 
 function clearPolicyCache(sessionId) {
@@ -559,6 +642,7 @@ function dropSocketSession(
   if (!session) return;
 
   clearReconnectTimer(session);
+  clearRecoveryStableTimer(session);
   session.disposed = true;
 
   // Release any waiter that is blocked waiting for QR readiness. The waiter
@@ -1069,17 +1153,37 @@ function disconnectDetails(lastDisconnect) {
     error?.output?.payload?.message ||
     "WhatsApp connection closed";
 
-  // Baileys attaches the WhatsApp stream-error reason node to Boom.data.
-  // Keep only the small classification fields we need for diagnostics. Never
-  // persist the full node because it may contain protocol/account metadata.
-  const reasonNode =
-    error?.data && typeof error.data === "object" ? error.data : null;
-  const reasonTag =
-    typeof reasonNode?.tag === "string" ? reasonNode.tag : null;
+  // Current Baileys attaches the full stream:error node to Boom.data, while
+  // older/custom wrappers may expose the reason node directly or under
+  // data.reasonNode. Support all three shapes and persist only tiny classifier
+  // fields, never the protocol node itself.
+  const data = error?.data && typeof error.data === "object" ? error.data : null;
+  const fullErrorNode =
+    data?.tag === "stream:error"
+      ? data
+      : data?.fullErrorNode?.tag === "stream:error"
+      ? data.fullErrorNode
+      : null;
+  const directReasonNode =
+    data?.reasonNode && typeof data.reasonNode === "object"
+      ? data.reasonNode
+      : data?.tag && data.tag !== "stream:error"
+      ? data
+      : null;
+  const streamChildren = Array.isArray(fullErrorNode?.content)
+    ? fullErrorNode.content.filter(
+        (child) => child && typeof child === "object" && typeof child.tag === "string"
+      )
+    : [];
+  const reasonNode = directReasonNode || streamChildren[0] || null;
+  const conflictNode =
+    reasonNode?.tag === "conflict"
+      ? reasonNode
+      : streamChildren.find((child) => child.tag === "conflict") || null;
+  const reasonTag = conflictNode?.tag || reasonNode?.tag || null;
   const conflictType =
-    reasonTag === "conflict" &&
-    typeof reasonNode?.attrs?.type === "string"
-      ? reasonNode.attrs.type
+    conflictNode && typeof conflictNode?.attrs?.type === "string"
+      ? conflictNode.attrs.type
       : null;
 
   return {
@@ -1557,13 +1661,18 @@ export async function startSession(
     registered: Boolean(state?.creds?.registered),
     openedOnce: false,
     openedAtMs: null,
+    durableConnectedAt: null,
+    recoveryStableTimer: null,
+    recoveryHealthyMarked: false,
+    recoveryHealthyMarkInFlight: false,
     passkeyRequired: false,
     reconnectTimer: null,
     lastError: null,
-    // This flag is set only by RidePicker immediately before socket.logout().
-    // A remote/unsolicited 401 must never be allowed to impersonate that intent.
+    // Only requestRemoteLogoutForSession() may set this intent. A remote or
+    // unsolicited 401 must never be allowed to impersonate a user logout.
     logoutRequested: false,
     logoutRequestedAt: null,
+    logoutPromise: null,
     disposed: false,
   };
 
@@ -1752,11 +1861,13 @@ export async function startSession(
 
     if (connection === "open") {
       clearReconnectTimer(session);
-      // Do not reset an unexpected-401 retry budget merely because a recovery
-      // socket reaches open for a moment. A conflict can recur immediately
-      // after open. The budget is reset lazily only after a genuinely stable
-      // connection window.
+      // Reaching open is not enough to forgive an earlier 401. The durable
+      // recovery budget is cleared only by real message traffic or a continuous
+      // five-minute open window.
       session.openedAtMs = Date.now();
+      clearRecoveryStableTimer(session);
+      session.recoveryHealthyMarked = false;
+      session.recoveryHealthyMarkInFlight = false;
       session.logoutRequested = false;
       session.logoutRequestedAt = null;
       session.openedOnce = true;
@@ -1816,13 +1927,22 @@ export async function startSession(
         "WhatsApp connected"
       );
 
-      await persistSessionState(session, {
+      const persistedConnection = await persistSessionState(session, {
         status: "CONNECTED",
         whatsapp_phone: account.phone,
         display_name: account.name,
         connected_at: connectedAt,
         last_seen_at: connectedAt,
       });
+
+      session.durableConnectedAt =
+        persistedConnection?.connected_at || connectedAt;
+
+      if (persistedConnection?.recovery_state === "recovering") {
+        scheduleRecoveryHealthyFallback(session);
+      } else {
+        session.recoveryHealthyMarked = true;
+      }
 
       await addSessionActivity(
         session,
@@ -1888,7 +2008,7 @@ export async function startSession(
       // purge auth early and also prevents duplicate disconnect activity rows.
       if (session.logoutRequested) {
         clearReconnectTimer(session);
-        unexpectedLogoutRecoveryAttempts.delete(id);
+        clearRecoveryStableTimer(session);
         session.lastError = null;
 
         console.log(`[${id}] expected close during requested WhatsApp logout`);
@@ -2048,63 +2168,82 @@ export async function startSession(
         return;
       }
 
-      // An unsolicited 401 is NOT sufficient proof of a terminal logout.
-      // Baileys v7 can surface transient conflict/device_removed stream errors
-      // for a previously healthy companion. Preserve registered Supabase auth
-      // and make a few bounded recovery attempts. If WhatsApp really removed
-      // the device, stop in ERROR with auth preserved so only an explicit user
-      // re-pair can replace it.
+      // An unsolicited 401 is ambiguous. In particular, current Baileys
+      // versions have real-world reports of conflict/device_removed on sessions
+      // that were not actually removed. Postgres owns the retry budget so a
+      // process restart cannot turn this into an infinite retry loop.
       if (statusCode === DisconnectReason.loggedOut) {
-        const stableOpen =
-          Number.isFinite(session.openedAtMs) &&
-          Date.now() - session.openedAtMs >= 60_000;
+        clearRecoveryStableTimer(session);
+        session.status = "RECONNECTING";
 
-        if (stableOpen) {
-          unexpectedLogoutRecoveryAttempts.delete(id);
-        }
+        const terminalCandidate =
+          reasonTag === "conflict" && conflictType === "device_removed";
 
-        const attempt =
-          (unexpectedLogoutRecoveryAttempts.get(id) || 0) + 1;
-        unexpectedLogoutRecoveryAttempts.set(id, attempt);
-
-        if (attempt > UNEXPECTED_LOGOUT_RETRY_DELAYS_MS.length) {
-          clearReconnectTimer(session);
+        let recoveryDecision;
+        try {
+          recoveryDecision = await repository.registerWhatsappUnexpected401(id, {
+            reasonTag,
+            conflictType,
+            terminalCandidate,
+          });
+          if (recoveryDecision?.sessionRow) {
+            updatePolicyCache(recoveryDecision.sessionRow);
+          }
+        } catch (error) {
+          // If durable accounting is unavailable, do not guess and do not
+          // hammer WhatsApp. Stop locally with auth preserved.
           session.status = "ERROR";
           session.lastError = {
-            code: "UNEXPECTED_401_RECOVERY_EXHAUSTED",
-            message,
+            code: "RECOVERY_STATE_UNAVAILABLE",
+            message: error.message,
           };
-
-          console.error(
-            `[${id}] unexpected WhatsApp 401 recovery exhausted; preserving auth`
-          );
           logWhatsappEvent(
             session,
             "error",
-            "unexpected_401_recovery_exhausted",
+            "unexpected_401_recovery_state_failed",
+            error.message,
+            { statusCode, reasonTag, conflictType, authPreserved: true }
+          );
+          dropSocketSession(session, {
+            removeAuth: false,
+            reason: "Could not persist unexpected 401 recovery state",
+          });
+          return;
+        }
+
+        const attempt = Number(recoveryDecision?.attemptCount || 0);
+
+        if (recoveryDecision?.action !== "retry") {
+          session.status = "ERROR";
+          session.lastError = {
+            code: "RELINK_REQUIRED",
+            message:
+              "WhatsApp no longer accepts the saved RidePicker link. Generate a new connection code to link it again.",
+          };
+
+          logWhatsappEvent(
+            session,
+            "warning",
+            "unexpected_401_relink_required",
             message,
             {
               statusCode,
               reasonTag,
               conflictType,
-              attempts: attempt - 1,
+              attempt,
+              terminalCandidate,
               authPreserved: true,
             }
           );
 
-          await persistSessionState(session, {
-            status: "ERROR",
-          });
-
           dropSocketSession(session, {
             removeAuth: false,
-            reason: "Unexpected WhatsApp 401 recovery exhausted",
+            reason: "WhatsApp relink required after bounded 401 recovery",
           });
           return;
         }
 
-        const delayMs = UNEXPECTED_LOGOUT_RETRY_DELAYS_MS[attempt - 1];
-        session.status = "RECONNECTING";
+        const delayMs = Math.max(0, Number(recoveryDecision.retryDelayMs || 0));
 
         console.warn(
           `[${id}] unexpected WhatsApp 401; preserving auth and retrying in ${delayMs}ms`
@@ -2120,14 +2259,10 @@ export async function startSession(
             conflictType,
             attempt,
             delayMs,
+            terminalCandidate,
             authPreserved: true,
           }
         );
-
-        // Do not touch bot_mode, account identity, connected_at, or auth here.
-        await persistSessionState(session, {
-          status: "RECONNECTING",
-        });
 
         await forwardSessionEvent({
           event: "session.reconnecting",
@@ -2235,6 +2370,10 @@ export async function startSession(
 
     if (type !== "notify") {
       return;
+    }
+
+    if (!session.recoveryHealthyMarked && session.durableConnectedAt) {
+      void markSessionRecoveryHealthy(session, { evidence: "message_notify" });
     }
 
     for (const message of messages) {
@@ -2387,6 +2526,28 @@ export async function requestPairingCode({
   }
 }
 
+async function prepareExplicitRelink(dbSession) {
+  if (!dbSession || dbSession.recovery_state !== "relink_required") {
+    return dbSession;
+  }
+
+  stopManagedPairingFlow(dbSession.id);
+  const runtime = sessions.get(dbSession.id) || null;
+  if (runtime && isCurrentSession(runtime)) {
+    dropSocketSession(runtime, {
+      removeAuth: false,
+      reason: "Preparing explicit WhatsApp relink",
+    });
+  }
+
+  // This call is serialized behind any pending auth writes and the database RPC
+  // only permits cleanup for ERROR + relink_required. No healthy link can pass.
+  await clearSupabaseAuthStateForRelink(dbSession.id);
+  const refreshed = await repository.getWhatsappSessionById(dbSession.id);
+  if (refreshed) updatePolicyCache(refreshed);
+  return refreshed || dbSession;
+}
+
 export async function startManagedSession(
   userId,
   { method = "qr", phone = null } = {}
@@ -2409,11 +2570,13 @@ export async function startManagedSession(
     throw error;
   }
 
-  const dbSession = await repository.ensureWhatsappSession(userId);
+  let dbSession = await repository.ensureWhatsappSession(userId);
 
   if (!dbSession) {
     throw new Error("Could not create WhatsApp session");
   }
+
+  dbSession = await prepareExplicitRelink(dbSession);
 
   const session = await startSession(dbSession.id, {
     userId,
@@ -2474,7 +2637,7 @@ export async function requestManagedPairingCode(userId, phone = null) {
     throw error;
   }
 
-  const dbSession = await repository.ensureWhatsappSession(userId);
+  let dbSession = await repository.ensureWhatsappSession(userId);
   const user = await repository.getUserRowById(userId);
 
   if (!user) {
@@ -2483,6 +2646,7 @@ export async function requestManagedPairingCode(userId, phone = null) {
     throw error;
   }
 
+  dbSession = await prepareExplicitRelink(dbSession);
   let session = sessions.get(dbSession.id) || null;
 
   if (session?.registered || dbSession.status === "CONNECTED") {
@@ -2590,7 +2754,7 @@ export async function requestManagedPairingCode(userId, phone = null) {
 }
 
 export async function refreshManagedQr(userId) {
-  const dbSession = await repository.getWhatsappSessionByUser(userId);
+  let dbSession = await repository.getWhatsappSessionByUser(userId);
 
   if (!dbSession) {
     return startManagedSession(userId, {
@@ -2598,6 +2762,7 @@ export async function refreshManagedQr(userId) {
     });
   }
 
+  dbSession = await prepareExplicitRelink(dbSession);
   let session = sessions.get(dbSession.id);
 
   if (!session?.socket) {
@@ -2623,6 +2788,15 @@ export async function retryManagedSession(userId) {
     });
   }
 
+  if (dbSession.recovery_state === "relink_required") {
+    const error = new Error(
+      "WhatsApp needs a new connection code. The old saved link was preserved but is no longer being retried."
+    );
+    error.status = 409;
+    error.details = { code: "RELINK_REQUIRED" };
+    throw error;
+  }
+
   stopManagedPairingFlow(dbSession.id);
 
   const current = sessions.get(dbSession.id);
@@ -2645,6 +2819,36 @@ export async function retryManagedSession(userId) {
   return normalizeManagedSession(latest, session);
 }
 
+export async function requestRemoteLogoutForSession(session) {
+  if (!session?.socket || typeof session.socket.logout !== "function") {
+    const error = new Error("Active WhatsApp socket is unavailable for logout.");
+    error.status = 409;
+    throw error;
+  }
+
+  if (session.logoutPromise) {
+    return session.logoutPromise;
+  }
+
+  const socket = session.socket;
+  session.logoutRequested = true;
+  session.logoutRequestedAt = new Date().toISOString();
+
+  session.logoutPromise = (async () => {
+    try {
+      await socket.logout();
+    } catch (error) {
+      session.logoutRequested = false;
+      session.logoutRequestedAt = null;
+      throw error;
+    } finally {
+      session.logoutPromise = null;
+    }
+  })();
+
+  return session.logoutPromise;
+}
+
 export async function disconnectSession(
   sessionId,
   { requestRemoteLogout = false } = {}
@@ -2665,18 +2869,11 @@ export async function disconnectSession(
         throw error;
       }
 
-      session.logoutRequested = true;
-      session.logoutRequestedAt = new Date().toISOString();
-
       try {
-        // Match Baileys' own logout semantics exactly. Baileys sends
-        // remove-companion-device with sendNode() and then ends the socket.
-        // This confirms that the stanza was written to the transport, not that
-        // WhatsApp returned an IQ acknowledgement. Do not claim remote ACK.
-        await session.socket.logout();
+        // requestRemoteLogoutForSession is the only production primitive that
+        // may mark a close as intentional.
+        await requestRemoteLogoutForSession(session);
       } catch (error) {
-        session.logoutRequested = false;
-        session.logoutRequestedAt = null;
         console.warn(`[${sessionId}] logout failed:`, error.message);
         if (!error.status) {
           error.status = 502;
@@ -2691,9 +2888,7 @@ export async function disconnectSession(
 
     try {
       if (session.socket) {
-        session.logoutRequested = true;
-        session.logoutRequestedAt = new Date().toISOString();
-        await session.socket.logout();
+        await requestRemoteLogoutForSession(session);
       }
     } catch (error) {
       console.warn(`[${sessionId}] logout warning:`, error.message);
@@ -2768,6 +2963,14 @@ let status =
   dbStatus && terminalDbStatus.has(dbStatus)
     ? dbStatus
     : memorySession?.status || dbStatus || "DISCONNECTED";
+const relinkRequired = dbSession?.recovery_state === "relink_required";
+
+// Internally this remains ERROR so restart recovery never trusts the stale
+// credentials. User-facing state is disconnected so the pairing UI offers a
+// fresh connection code immediately.
+if (relinkRequired) {
+  status = "DISCONNECTED";
+}
 
   // While automatic pairing is active, QR is only an internal readiness
   // signal. The user-facing state remains STARTING until a phone code is
@@ -2840,7 +3043,15 @@ let status =
         }
       : null,
     error:
-      managedFlow?.lastError || memorySession?.lastError || null,
+      managedFlow?.lastError ||
+      memorySession?.lastError ||
+      (relinkRequired
+        ? {
+            code: "RELINK_REQUIRED",
+            message:
+              "WhatsApp needs a new connection code. Your old saved link was preserved and will not be retried again.",
+          }
+        : null),
     pairingProgress: managedFlow
       ? {
           phase: pairingCode

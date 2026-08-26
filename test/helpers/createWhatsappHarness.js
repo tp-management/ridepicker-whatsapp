@@ -81,6 +81,7 @@ export async function createWhatsappHarnessFromSource({
       `}\n` +
       `export async function loadSupabaseAuthState(sessionId) { let state = states.get(sessionId); if (!state) { state = freshState(); states.set(sessionId, state); } return { state, saveCreds: async () => {} }; }\n` +
       `export async function clearSupabaseAuthState(sessionId) { states.delete(sessionId); }\n` +
+      `export async function clearSupabaseAuthStateForRelink(sessionId) { states.delete(sessionId); }\n` +
       `export async function hasSupabaseAuthState(sessionId) { return states.has(sessionId); }\n`
   );
 
@@ -110,7 +111,7 @@ export async function createWhatsappHarnessFromSource({
       `function ensureRow(userId) {\n` +
       `  let row = sessionsByUser.get(userId);\n` +
       `  if (!row) {\n` +
-      `    row = { id: \`session-\${userId}\`, user_id: userId, status: \"DISCONNECTED\", bot_mode: \"off\", whatsapp_phone: null, display_name: null, connected_at: null, last_seen_at: null };\n` +
+      `    row = { id: \`session-\${userId}\`, user_id: userId, status: \"DISCONNECTED\", bot_mode: \"off\", whatsapp_phone: null, display_name: null, connected_at: null, last_seen_at: null, recovery_state: \"idle\", recovery_attempt_count: 0, recovery_incident_started_at: null, recovery_last_event_at: null, recovery_reason_tag: null, recovery_conflict_type: null };\n` +
       `    sessionsByUser.set(userId, row);\n` +
       `    sessionsById.set(row.id, row);\n` +
       `  }\n` +
@@ -124,6 +125,8 @@ export async function createWhatsappHarnessFromSource({
       `  async listWhatsappSessions() { return Array.from(sessionsById.values()); },\n` +
       `  async updateWhatsappSessionById(sessionId, patch) { const row = sessionsById.get(sessionId); if (!row) return null; Object.assign(row, patch); return row; },\n` +
       `  async updateWhatsappSessionByUser(userId, patch) { const row = ensureRow(userId); Object.assign(row, patch); return row; },\n` +
+      `  async registerWhatsappUnexpected401(sessionId, { reasonTag = null, conflictType = null, terminalCandidate = false } = {}) { const row = sessionsById.get(sessionId); if (!row) throw new Error(\"session not found\"); if (row.recovery_state === \"relink_required\") return { action: \"relink_required\", attemptCount: row.recovery_attempt_count, retryDelayMs: null, recoveryState: row.recovery_state, sessionRow: row }; if (row.recovery_state !== \"recovering\") { row.recovery_attempt_count = 0; row.recovery_incident_started_at = new Date().toISOString(); } row.recovery_attempt_count += 1; row.recovery_last_event_at = new Date().toISOString(); row.recovery_reason_tag = reasonTag; row.recovery_conflict_type = conflictType; let delay = null; if (terminalCandidate) { delay = row.recovery_attempt_count === 1 ? 2000 : null; } else { delay = [2000, 10000, 30000][row.recovery_attempt_count - 1] ?? null; } row.recovery_state = delay === null ? \"relink_required\" : \"recovering\"; row.status = delay === null ? \"ERROR\" : \"RECONNECTING\"; return { action: delay === null ? \"relink_required\" : \"retry\", attemptCount: row.recovery_attempt_count, retryDelayMs: delay, recoveryState: row.recovery_state, sessionRow: row }; },\n` +
+      `  async markWhatsappRecoveryStable(sessionId, connectedAt) { const row = sessionsById.get(sessionId); if (!row || row.status !== \"CONNECTED\" || row.connected_at !== connectedAt || row.recovery_state === \"idle\") return false; row.recovery_state = \"idle\"; row.recovery_attempt_count = 0; row.recovery_incident_started_at = null; row.recovery_last_event_at = null; row.recovery_reason_tag = null; row.recovery_conflict_type = null; return true; },\n` +
       `  async addActivity(userId, entry) { const row = { userId, ...entry }; activities.push(row); return row; },\n` +
       `  async upsertChat() { return null; },\n` +
       `  async insertMessage() { return null; },\n` +

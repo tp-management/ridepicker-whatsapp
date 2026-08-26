@@ -84,6 +84,18 @@ export function createSupabaseAuthStore({ request = supabaseRequest } = {}) {
     );
   }
 
+  async function clearForRelink(sessionId) {
+    await enqueue(sessionId, () =>
+      request("rpc/ridepicker_whatsapp_auth_prepare_relink", {
+        method: "POST",
+        body: {
+          p_session_id: sessionId,
+          p_auth_type: SUPABASE_AUTH_TYPE,
+        },
+      })
+    );
+  }
+
   async function has(sessionId) {
     const rows = await readRows(sessionId, [CREDS_KEY]);
     return rows.some((row) => row?.auth_key === CREDS_KEY && row?.payload);
@@ -164,6 +176,7 @@ export function createSupabaseAuthStore({ request = supabaseRequest } = {}) {
     load,
     has,
     clear,
+    clearForRelink,
     waitForMutations,
   };
 }
@@ -180,4 +193,8 @@ export function hasSupabaseAuthState(sessionId) {
 
 export function clearSupabaseAuthState(sessionId) {
   return defaultStore.clear(sessionId);
+}
+
+export function clearSupabaseAuthStateForRelink(sessionId) {
+  return defaultStore.clearForRelink(sessionId);
 }
