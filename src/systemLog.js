@@ -12,18 +12,43 @@ const REDACTED_KEYS = new Set([
   "apikey",
   "api_key",
   "token",
+  "access_token",
+  "refresh_token",
   "secret",
   "password",
   "cookie",
+  "set-cookie",
   "pairingcode",
   "pairing_code",
   "qr",
   "qrdata",
   "qr_data",
+  "creds",
+  "credentials",
+  "privatekey",
+  "private_key",
 ]);
 
+const WHATSAPP_JID_PATTERN =
+  /(?:[a-z0-9._+-]+|\d+(?::\d+)?)@(?:s\.whatsapp\.net|lid|c\.us|g\.us|broadcast|newsletter)/gi;
+const PHONE_IDENTIFIER_PATTERN =
+  /(?<![\w@])\+?\d(?:[\s().-]*\d){6,14}(?![\w@])/g;
+const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
+const SENSITIVE_QUERY_PATTERN =
+  /([?&](?:token|access_token|refresh_token|secret|apikey|api_key)=)[^&#\s]+/gi;
+
+const PROCESS_STARTED_AT = new Date().toISOString();
+
+function sanitizeText(value) {
+  return String(value ?? "")
+    .replace(WHATSAPP_JID_PATTERN, "[redacted-jid]")
+    .replace(PHONE_IDENTIFIER_PATTERN, "[redacted-phone]")
+    .replace(BEARER_PATTERN, "Bearer [redacted]")
+    .replace(SENSITIVE_QUERY_PATTERN, "$1[redacted]");
+}
+
 function safeString(value, maxLength = 1500) {
-  const text = String(value ?? "");
+  const text = sanitizeText(value);
 
   if (text.length <= maxLength) {
     return text;
@@ -45,12 +70,13 @@ function sanitize(value, depth = 0) {
     return {
       name: value.name || "Error",
       message: safeString(value.message || ""),
-      status: value.status || null,
+      status: value.status || value.statusCode || null,
       code:
         value.code ||
         value?.output?.statusCode ||
         value?.output?.payload?.statusCode ||
         null,
+      stack: value.stack ? safeString(value.stack, 3000) : null,
     };
   }
 
@@ -102,34 +128,75 @@ function normalizeSource(source) {
   return value;
 }
 
-function withProvenance(source, details) {
+function runtimeContext() {
+  return {
+    projectId: process.env.RAILWAY_PROJECT_ID || null,
+    environmentId: process.env.RAILWAY_ENVIRONMENT_ID || null,
+    serviceId: process.env.RAILWAY_SERVICE_ID || null,
+    deploymentId: process.env.RAILWAY_DEPLOYMENT_ID || null,
+    replicaId: process.env.RAILWAY_REPLICA_ID || null,
+    gitCommit:
+      process.env.RAILWAY_GIT_COMMIT_SHA ||
+      process.env.RAILWAY_GIT_COMMIT ||
+      null,
+    node: process.version,
+    pid: process.pid,
+    processStartedAt: PROCESS_STARTED_AT,
+  };
+}
+
+function classifyActionability(source, event, level) {
+  if (source === "n8n" && event === "n8n_failed") {
+    return "expected";
+  }
+
+  if (/relink_required|recovery_state_failed|validation_failed/i.test(event)) {
+    return "actionable";
+  }
+
+  if (level === "error") return "actionable";
+  if (level === "warning") return "attention";
+  return "diagnostic";
+}
+
+function provenanceFor(source) {
+  if (source === "whatsapp_raw") return "whatsapp_raw";
+  if (source === "baileys_raw") return "baileys_raw";
+  if (source === "ridepicker_whatsapp") return "ridepicker_whatsapp";
+  return "ridepicker_backend";
+}
+
+function withProvenance(source, event, level, details) {
   const sanitized = sanitize(details || {});
+  const base =
+    sanitized && typeof sanitized === "object" && !Array.isArray(sanitized)
+      ? sanitized
+      : { value: sanitized };
 
-  if (!sanitized || typeof sanitized !== "object" || Array.isArray(sanitized)) {
-    return sanitized;
-  }
-
-  if (Object.prototype.hasOwnProperty.call(sanitized, "provenance")) {
-    return sanitized;
-  }
-
-  if (source === "whatsapp_raw") {
-    return { ...sanitized, provenance: "whatsapp_raw" };
-  }
-
-  if (source === "baileys_raw") {
-    return { ...sanitized, provenance: "baileys_raw" };
-  }
-
-  return sanitized;
+  return {
+    ...base,
+    provenance:
+      base.provenance || provenanceFor(source),
+    actionability:
+      base.actionability || classifyActionability(source, event, level),
+    runtime: {
+      ...runtimeContext(),
+      ...(base.runtime && typeof base.runtime === "object" ? base.runtime : {}),
+    },
+    ...(source === "n8n" && event === "n8n_failed"
+      ? { expectedByDesign: true }
+      : {}),
+  };
 }
 
 /**
  * Best-effort persistent system logging.
  *
- * WhatsApp diagnostics in Supabase must come from the native Baileys logger.
- * RidePicker-authored WhatsApp lifecycle sentences are intentionally not
- * persisted here. Other application sources such as n8n/backend remain valid.
+ * The persistent timeline intentionally keeps both native Baileys diagnostics
+ * and RidePicker-authored lifecycle events. The latter explain what decision
+ * the application made after a low-level protocol event, which is essential
+ * when diagnosing reconnect/relink behavior. Logging must never become part of
+ * the correctness path: a logging failure is reported to Railway and swallowed.
  */
 export async function writeSystemLog({
   userId = null,
@@ -148,10 +215,7 @@ export async function writeSystemLog({
     ? level
     : "info";
   const normalizedSource = normalizeSource(source);
-
-  if (normalizedSource === "ridepicker_whatsapp") {
-    return null;
-  }
+  const normalizedEvent = safeString(event, 150);
 
   try {
     const rows = await insertRows("system_logs", [
@@ -160,18 +224,30 @@ export async function writeSystemLog({
         session_id: sessionId || null,
         level: normalizedLevel,
         source: normalizedSource,
-        event: safeString(event, 150),
+        event: normalizedEvent,
         message: message ? safeString(message, 1500) : null,
-        details: withProvenance(normalizedSource, details),
+        details: withProvenance(
+          normalizedSource,
+          normalizedEvent,
+          normalizedLevel,
+          details
+        ),
       },
     ]);
 
     return Array.isArray(rows) && rows.length ? rows[0] : null;
   } catch (error) {
     console.error(
-      `[system_logs] write failed for ${event}:`,
-      error.message
+      `[system_logs] write failed for ${normalizedEvent}:`,
+      safeString(error.message)
     );
     return null;
   }
 }
+
+export const __systemLog = {
+  classifyActionability,
+  runtimeContext,
+  sanitize,
+  safeString,
+};
