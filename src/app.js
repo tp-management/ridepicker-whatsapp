@@ -2,6 +2,8 @@ import express from "express";
 import cors from "cors";
 
 import { FRONTEND_ORIGINS } from "./config.js";
+import { createApiSecurityMiddleware } from "./apiSecurity.js";
+import authRouter from "./authRoutes.js";
 import assistPreferencesRouter from "./assistPreferencesRoutes.js";
 import activityRouter from "./activityRoutes.js";
 import healthRouter from "./healthRouter.js";
@@ -56,9 +58,19 @@ export function createApp() {
   );
 
   // Railway only moves traffic to a new container after restart recovery has
-  // examined every durable WhatsApp session. The legacy /health route mounted
-  // later remains unreachable because this router answers first.
+  // examined every durable WhatsApp session. Health must remain public so
+  // Railway can complete deployments before any user traffic is accepted.
   app.use(healthRouter);
+
+  // The verified phone bootstrap is the only account entry point that is
+  // reachable before the ownership gate. It verifies its own Supabase bearer
+  // token before it can bind or create an application user.
+  app.use(authRouter);
+
+  // IMPORTANT: mount this before SSE and every /api/users/:userId router.
+  // Otherwise a browser could bypass ownership through the long-lived event
+  // stream even if ordinary REST routes were protected.
+  app.use(createApiSecurityMiddleware());
 
   // One persistent server-sent event stream replaces periodic browser polling.
   // The stream carries only invalidation scopes, never database row contents.
@@ -96,7 +108,10 @@ export function createApp() {
         : 500;
 
     return res.status(status).json({
-      error: status >= 500 ? "Internal server error" : error?.message || "Request failed",
+      error:
+        status >= 500
+          ? "Internal server error"
+          : error?.message || "Request failed",
       requestId: req.requestId || null,
     });
   });
