@@ -2,7 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 
-import { classifyActivityKey } from "../src/activityRoutes.js";
+import {
+  canonicalActivityKey,
+  classifyActivityKey,
+  normalizeActivityPriority,
+} from "../src/activityRoutes.js";
 
 test("activity ids classify explicit and synthetic message entries", () => {
   assert.deepEqual(classifyActivityKey("42"), {
@@ -40,4 +44,33 @@ test("activity dismissal storage is server-only and durable", async () => {
   assert.match(sql, /PRIMARY KEY \(user_id, activity_key\)/i);
   assert.match(sql, /ENABLE ROW LEVEL SECURITY/i);
   assert.match(sql, /GRANT SELECT, INSERT, DELETE ON TABLE public\.activity_dismissals TO service_role/i);
+});
+
+
+test("activity priority is canonical and restricted to regular/high", () => {
+  assert.equal(canonicalActivityKey("42"), "activity:42");
+  assert.equal(canonicalActivityKey("activity:42"), "activity:42");
+  assert.equal(canonicalActivityKey("message:11"), "message:11");
+  assert.equal(normalizeActivityPriority("regular"), "regular");
+  assert.equal(normalizeActivityPriority("HIGH"), "high");
+  assert.throws(
+    () => normalizeActivityPriority("urgent"),
+    /priority must be regular or high/
+  );
+});
+
+test("Activity priority storage covers real activity and synthetic messages", async () => {
+  const source = await fs.readFile("src/activityRoutes.js", "utf8");
+  const sql = await fs.readFile(
+    "supabase/migrations/20261026_activity_priorities.sql",
+    "utf8"
+  );
+
+  assert.match(source, /activity_priorities/);
+  assert.match(source, /priority: priorities\.get\(canonicalActivityKey\(entry\.id\)\) \|\| "regular"/);
+  assert.match(source, /router\.patch\(/);
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS public\.activity_priorities/i);
+  assert.match(sql, /priority text NOT NULL DEFAULT 'regular'/i);
+  assert.match(sql, /priority IN \('regular', 'high'\)/i);
+  assert.match(sql, /ENABLE ROW LEVEL SECURITY/i);
 });
