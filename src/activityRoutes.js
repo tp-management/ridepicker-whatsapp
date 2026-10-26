@@ -87,6 +87,14 @@ export function normalizeActivityPriority(value) {
   return priority;
 }
 
+// Remove per-user overrides when an item leaves the Activity timeline.
+async function deleteActivityPriority(userId, activityKey) {
+  await deleteRows("activity_priorities", {
+    user_id: `eq.${userId}`,
+    activity_key: `eq.${canonicalActivityKey(activityKey)}`,
+  });
+}
+
 async function activityTargetExists(userId, target) {
   if (target.type === "activity") {
     const rows = await selectRows("activity", {
@@ -172,6 +180,12 @@ router.patch(
       }
 
       const activityKey = canonicalActivityKey(target.key);
+      // Regular is the default: remove the override instead of storing noise.
+      if (priority === "regular") {
+        await deleteActivityPriority(userId, activityKey);
+        return res.json({ activityId: target.key, priority });
+      }
+
       const rows = await insertRows(
         "activity_priorities",
         [
@@ -214,6 +228,7 @@ router.delete(
         if (!deleted.length) {
           return res.status(404).json({ error: "activity not found" });
         }
+        await deleteActivityPriority(userId, target.key);
         return res.json({ ok: true, deleted: target.key, sourcePreserved: false });
       }
 
@@ -243,6 +258,7 @@ router.delete(
         }
       );
 
+      await deleteActivityPriority(userId, target.key);
       return res.json({ ok: true, deleted: target.key, sourcePreserved: true });
     } catch (error) {
       sendError(res, error);
