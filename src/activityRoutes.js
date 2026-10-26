@@ -7,6 +7,7 @@ import { userApiRepository } from "./userApiRepository.js";
 
 const router = express.Router();
 const MAX_ACTIVITY_LIMIT = 500;
+const ACTIVITY_PRIORITIES = new Set(["regular", "high"]);
 
 function sendError(res, error) {
   const status = error.status || 500;
@@ -69,6 +70,46 @@ export function classifyActivityKey(value) {
   throw error;
 }
 
+export function canonicalActivityKey(value) {
+  const target = classifyActivityKey(value);
+  return target.type === "message"
+    ? `message:${target.id}`
+    : `activity:${target.id}`;
+}
+
+export function normalizeActivityPriority(value) {
+  const priority = String(value || "").trim().toLowerCase();
+  if (!ACTIVITY_PRIORITIES.has(priority)) {
+    const error = new Error("priority must be regular or high");
+    error.status = 400;
+    throw error;
+  }
+  return priority;
+}
+
+async function activityTargetExists(userId, target) {
+  if (target.type === "activity") {
+    const rows = await selectRows("activity", {
+      select: "id",
+      id: `eq.${target.id}`,
+      user_id: `eq.${userId}`,
+      limit: 1,
+    });
+    return rows.length > 0;
+  }
+
+  const session = await repository.getWhatsappSessionByUser(userId);
+  if (!session) return false;
+
+  const rows = await selectRows("messages", {
+    select: "id",
+    id: `eq.${target.id}`,
+    session_id: `eq.${session.id}`,
+    limit: 1,
+  });
+  return rows.length > 0;
+}
+
 router.get("/api/users/:userId/activity", ...userRoute, async (req, res) => {
   try {
     const userId = req.params.userId;
@@ -82,14 +123,32 @@ router.get("/api/users/:userId/activity", ...userRoute, async (req, res) => {
       includeMessages,
     });
 
-    const dismissedRows = await selectRows("activity_dismissals", {
-      select: "activity_key",
-      user_id: `eq.${userId}`,
-      limit: 2000,
-    });
+    const [dismissedRows, priorityRows] = await Promise.all([
+      selectRows("activity_dismissals", {
+        select: "activity_key",
+        user_id: `eq.${userId}`,
+        limit: 2000,
+      }),
+      selectRows("activity_priorities", {
+        select: "activity_key,priority",
+        user_id: `eq.${userId}`,
+        limit: 2000,
+      }),
+    ]);
+
     const dismissed = new Set(dismissedRows.map((row) => String(row.activity_key)));
+    const priorities = new Map(
+      priorityRows.map((row) => [
+        String(row.activity_key),
+        ACTIVITY_PRIORITIES.has(row.priority) ? row.priority : "regular",
+      ])
+    );
     const activity = candidates
       .filter((entry) => !dismissed.has(String(entry.id)))
+      .map((entry) => ({
+        ...entry,
+        priority: priorities.get(canonicalActivityKey(entry.id)) || "regular",
+      }))
       .slice(0, limit);
 
     res.setHeader("Cache-Control", "no-store");
@@ -98,6 +157,46 @@ router.get("/api/users/:userId/activity", ...userRoute, async (req, res) => {
     sendError(res, error);
   }
 });
+
+router.patch(
+  "/api/users/:userId/activity/:activityId",
+  ...userRoute,
+  async (req, res) => {
+    try {
+      const userId = req.params.userId;
+      const target = classifyActivityKey(req.params.activityId);
+      const priority = normalizeActivityPriority(req.body?.priority);
+
+      if (!(await activityTargetExists(userId, target))) {
+        return res.status(404).json({ error: "activity not found" });
+      }
+
+      const activityKey = canonicalActivityKey(target.key);
+      const rows = await insertRows(
+        "activity_priorities",
+        [
+          {
+            user_id: userId,
+            activity_key: activityKey,
+            priority,
+            updated_at: new Date().toISOString(),
+          },
+        ],
+        {
+          query: { on_conflict: "user_id,activity_key" },
+          prefer: "resolution=merge-duplicates,return=representation",
+        }
+      );
+
+      return res.json({
+        activityId: target.key,
+        priority: rows?.[0]?.priority || priority,
+      });
+    } catch (error) {
+      sendError(res, error);
+    }
+  }
+);
 
 router.delete(
   "/api/users/:userId/activity/:activityId",
