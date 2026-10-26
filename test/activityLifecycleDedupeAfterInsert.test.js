@@ -12,5 +12,9 @@ test("WhatsApp Activity dedupe keeps INSERT return semantics", async () => {
   assert.match(sql, /a\.id <> new\.id/i);
   assert.match(sql, /delete from public\.activity[\s\S]*where id = new\.id/i);
   assert.match(sql, /after insert on public\.activity/i);
-  assert.doesNotMatch(sql, /return null/i);
+
+  // Comments document the old BEFORE INSERT + RETURN NULL bug, so inspect only
+  // executable SQL when asserting the trigger no longer returns null.
+  const executableSql = sql.replace(/--.*$/gm, "");
+  assert.doesNotMatch(executableSql, /return null/i);
 });
