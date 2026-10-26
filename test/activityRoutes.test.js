@@ -74,3 +74,16 @@ test("Activity priority storage covers real activity and synthetic messages", as
   assert.match(sql, /priority IN \('regular', 'high'\)/i);
   assert.match(sql, /ENABLE ROW LEVEL SECURITY/i);
 });
+
+test("Regular clears the stored override; Activity deletion cleans both entry types", async () => {
+  const source = await fs.readFile("src/activityRoutes.js", "utf8");
+
+  assert.match(source, /if \(priority === "regular"\) \{[\s\S]*?deleteActivityPriority\(userId, activityKey\)/);
+  assert.match(source, /async function deleteActivityPriority\(userId, activityKey\) \{[\s\S]*?deleteRows\("activity_priorities"/);
+  assert.equal(
+    [...source.matchAll(/await deleteActivityPriority\(userId, target\.key\)/g)].length,
+    2,
+    "Both persisted Activity rows and synthetic message dismissals clear overrides"
+  );
+  assert.doesNotMatch(source, /deleteRows\("messages"/);
+});
