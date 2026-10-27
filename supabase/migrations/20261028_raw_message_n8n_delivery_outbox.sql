@@ -105,7 +105,7 @@ BEGIN
       m.message_timestamp, m.n8n_attempt_count
   )
   SELECT jsonb_build_object(
-    'id', c.id,
+    'id', c.id::text,
     'user_id', ws.user_id,
     'session_id', c.session_id,
     'whatsapp_message_id', c.whatsapp_message_id,
