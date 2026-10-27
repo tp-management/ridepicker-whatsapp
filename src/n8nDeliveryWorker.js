@@ -6,6 +6,8 @@ const POLL_MS = 2_000;
 const HTTP_TIMEOUT_MS = 15_000;
 const LEASE_SECONDS = 60;
 const MAX_ATTEMPTS = 8;
+const MAX_AUTH_ATTEMPTS = 5;
+const AUTH_RETRY_BASE_MS = 30_000;
 
 export function nextN8nDeliveryState({
   attemptCount,
@@ -15,12 +17,16 @@ export function nextN8nDeliveryState({
   random = Math.random,
 }) {
   const attempt = Math.max(1, Number(attemptCount) || 1);
-  // Most client errors are not transient: bad credentials/payloads need
-  // operator attention. 408 and 429 can recover, as can server/network errors.
-  const permanent = httpStatus >= 400 && httpStatus < 500
-    && httpStatus !== 408 && httpStatus !== 429;
-  const dead = permanent || attempt >= MAX_ATTEMPTS;
-  const delayMs = Math.min(10 * 60_000, 2_000 * 2 ** Math.min(attempt - 1, 9));
+  // n8n returns 404 when a workflow/webhook is temporarily inactive.
+  // 401/403 can happen during configuration or deployment, so retry them
+  // over a longer but bounded window rather than killing the first offer.
+  // Only clearly invalid payload responses fail immediately.
+  const invalidPayload = httpStatus === 400 || httpStatus === 422;
+  const authFailure = httpStatus === 401 || httpStatus === 403;
+  const maxAttempts = authFailure ? MAX_AUTH_ATTEMPTS : MAX_ATTEMPTS;
+  const dead = invalidPayload || attempt >= maxAttempts;
+  const baseDelayMs = authFailure ? AUTH_RETRY_BASE_MS : 2_000;
+  const delayMs = Math.min(10 * 60_000, baseDelayMs * 2 ** Math.min(attempt - 1, 9));
   const jitter = Math.floor(Math.max(0, random()) * 1_000);
 
   return {
