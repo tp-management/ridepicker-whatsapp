@@ -20,6 +20,7 @@ import {
 } from "./config.js";
 import { repository } from "./repository.js";
 import { writeSystemLog } from "./systemLog.js";
+import { isMarkedSelfChatTestMessage } from "./whatsapp/selfChatTest.js";
 import { createBaileysRawLogger } from "./whatsapp/logging/baileysLogger.js";
 import {
   clearSupabaseAuthState,
@@ -1509,9 +1510,21 @@ async function processMessage(session, socket, message) {
     chatName = senderName;
   }
 
+  // Normal outgoing WhatsApp messages stay context-only. Exception:
+  // '#rp-test' messages in this account's verified self-chat may exercise the
+  // real DB -> outbox -> n8n pipeline without involving a second phone.
+  const selfChatTest = isMarkedSelfChatTestMessage({
+    messageKey: message.key,
+    body,
+    socketUser: socket?.user,
+    authMe: socket?.authState?.creds?.me,
+    linkedPhone: policy.whatsapp_phone,
+  });
+
   // A permitted original message and its outbox entry are one atomic INSERT.
-  // Outgoing/non-text history is retained but never queued for AI.
-  const eligibleForAi = !fromMe && Boolean(String(body || "").trim());
+  // Incoming text/captions OR explicitly marked self-chat tests are queued.
+  const eligibleForAi =
+    Boolean(String(body || "").trim()) && (!fromMe || selfChatTest);
   let inserted = null;
 
   try {
