@@ -14,13 +14,14 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 
 import {
+  N8N_FORWARD_FROM_ME,
   N8N_FORWARD_SESSION_EVENTS,
   N8N_WEBHOOK_URL,
   SESSION_POLICY_CACHE_MS,
 } from "./config.js";
 import { repository } from "./repository.js";
 import { writeSystemLog } from "./systemLog.js";
-import { isMarkedSelfChatTestMessage } from "./whatsapp/selfChatTest.js";
+import { createOutgoingEchoGuard } from "./whatsapp/outgoingEchoGuard.js";
 import { createBaileysRawLogger } from "./whatsapp/logging/baileysLogger.js";
 import {
   clearSupabaseAuthState,
@@ -42,6 +43,7 @@ const managedPairingFlows = new Map();
 const groupNameCache = new Map();
 const policyCache = new Map();
 const chatWriteCache = new Map();
+const outgoingEchoGuard = createOutgoingEchoGuard();
 
 const GROUP_CACHE_TTL = 10 * 60 * 1000;
 const CHAT_WRITE_TTL = 10 * 60 * 1000;
@@ -1510,21 +1512,14 @@ async function processMessage(session, socket, message) {
     chatName = senderName;
   }
 
-  // Normal outgoing WhatsApp messages stay context-only. Exception:
-  // '#rp-test' messages in this account's verified self-chat may exercise the
-  // real DB -> outbox -> n8n pipeline without involving a second phone.
-  const selfChatTest = isMarkedSelfChatTestMessage({
-    messageKey: message.key,
-    body,
-    socketUser: socket?.user,
-    authMe: socket?.authState?.creds?.me,
-    linkedPhone: policy.whatsapp_phone,
-  });
-
-  // A permitted original message and its outbox entry are one atomic INSERT.
-  // Incoming text/captions OR explicitly marked self-chat tests are queued.
+  // Incoming text is always eligible. N8N_FORWARD_FROM_ME controls whether
+  // user-authored outgoing text is also queued; no special body markers.
+  // Replies sent via RidePicker /send never loop back into n8n.
+  const generatedByRidePicker =
+    fromMe && outgoingEchoGuard.shouldSuppress(session.id, chatId, whatsappMessageId);
   const eligibleForAi =
-    Boolean(String(body || "").trim()) && (!fromMe || selfChatTest);
+    Boolean(String(body || "").trim()) &&
+    (!fromMe || (N8N_FORWARD_FROM_ME && !generatedByRidePicker));
   let inserted = null;
 
   try {
@@ -3060,9 +3055,18 @@ export async function sendText({
     throw new Error("text is required");
   }
 
-  return session.socket.sendMessage(chatId, {
-    text,
-  });
+  // Baileys outgoing echoes can arrive before sendMessage resolves.
+  // Exclude /send-generated replies both during the send and after the WA ID
+  // becomes available, regardless of N8N_FORWARD_FROM_ME.
+  const finishSend = outgoingEchoGuard.beginSend(sessionId, chatId);
+  try {
+    const result = await session.socket.sendMessage(chatId, { text });
+    finishSend(result?.key?.id || null);
+    return result;
+  } catch (error) {
+    finishSend();
+    throw error;
+  }
 }
 
 async function restoreManagedSessions() {
