@@ -4,6 +4,7 @@ import cors from "cors";
 import { FRONTEND_ORIGINS } from "./config.js";
 import assistPreferencesRouter from "./assistPreferencesRoutes.js";
 import activityRouter from "./activityRoutes.js";
+import bigMoneyAlertRouter from "./bigMoneyAlertRoutes.js";
 import healthRouter from "./healthRouter.js";
 import liveEventsRouter, {
   installRepositoryLiveEvents,
@@ -71,6 +72,7 @@ export function createApp() {
 
   app.use(assistPreferencesRouter);
   app.use(activityRouter);
+  app.use(bigMoneyAlertRouter);
   app.use(userApiRouter);
   app.use(managedDisconnectRouter);
   app.use(router);
