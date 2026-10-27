@@ -13,12 +13,14 @@ ALTER TABLE public.messages
   ADD COLUMN IF NOT EXISTS n8n_next_attempt_at timestamptz,
   ADD COLUMN IF NOT EXISTS n8n_last_error text,
   ADD COLUMN IF NOT EXISTS n8n_locked_at timestamptz,
-  ADD COLUMN IF NOT EXISTS n8n_locked_by text;
+  ADD COLUMN IF NOT EXISTS n8n_locked_by text,
+  ADD COLUMN IF NOT EXISTS n8n_skipped_at timestamptz,
+  ADD COLUMN IF NOT EXISTS n8n_skip_reason text;
 
 ALTER TABLE public.messages
   ADD CONSTRAINT messages_n8n_delivery_status_check
   CHECK (n8n_delivery_status IS NULL OR n8n_delivery_status IN
-    ('pending','delivering','delivered','retry','dead'));
+    ('pending','delivering','delivered','retry','dead','skipped'));
 
 ALTER TABLE public.messages
   ADD CONSTRAINT messages_n8n_attempt_count_check CHECK (n8n_attempt_count >= 0);
@@ -70,6 +72,49 @@ BEGIN
     OR p_lease_seconds NOT BETWEEN 30 AND 600 THEN
     RAISE EXCEPTION 'invalid n8n worker claim parameters';
   END IF;
+
+  -- Drain ineligible queue entries before selecting any work. Without this,
+  -- an OFF -> ON toggle moves bot_enabled_at forward and leaves an older
+  -- pending/retry row in the outbox forever. Preserve RAW messages, but record
+  -- a terminal transport skip rather than accidentally replaying them.
+  --
+  -- SKIP LOCKED avoids interfering with an actively delivering worker.
+  -- Expired delivering leases are also cleaned up; active in-flight requests
+  -- are left to finish or time out before being classified.
+  WITH stale AS (
+    SELECT m.id,
+      CASE WHEN ws.bot_mode = 'off'
+        THEN 'RidePicker disabled before n8n delivery'
+        ELSE 'Message predates latest RidePicker enable time'
+      END AS reason
+    FROM public.messages m
+    JOIN public.whatsapp_sessions ws ON ws.id = m.session_id
+    WHERE (
+      m.n8n_delivery_status IN ('pending','retry')
+      OR (
+        m.n8n_delivery_status = 'delivering'
+        AND (m.n8n_locked_at IS NULL
+          OR m.n8n_locked_at < now() - make_interval(secs => p_lease_seconds))
+      )
+    )
+    AND (
+      ws.bot_mode = 'off'
+      OR (ws.bot_enabled_at IS NOT NULL AND m.message_timestamp < ws.bot_enabled_at)
+    )
+    ORDER BY m.id
+    LIMIT 100
+    FOR UPDATE OF m SKIP LOCKED
+  )
+  UPDATE public.messages m
+  SET n8n_delivery_status = 'skipped',
+      n8n_skipped_at = now(),
+      n8n_skip_reason = stale.reason,
+      n8n_last_error = NULL,
+      n8n_next_attempt_at = NULL,
+      n8n_locked_at = NULL,
+      n8n_locked_by = NULL
+  FROM stale
+  WHERE m.id = stale.id;
 
   RETURN QUERY
   WITH candidates AS (
@@ -127,4 +172,4 @@ GRANT EXECUTE ON FUNCTION public.claim_pending_n8n_messages(text,integer,integer
 TO service_role;
 
 COMMENT ON COLUMN public.messages.n8n_delivery_status IS
-  'Nullable transport state (NULL = not queued); independent of AI processing_status';
+  'Nullable transport state (NULL = not queued); skipped = became ineligible before delivery; independent of AI processing_status';
