@@ -169,7 +169,7 @@ test("OFF and re-enabled policies terminally skip queued messages without deleti
   assert.match(migration, /ADD COLUMN IF NOT EXISTS n8n_skipped_at timestamptz/i);
   assert.match(migration, /ADD COLUMN IF NOT EXISTS n8n_skip_reason text/i);
   const cleanupStart = migration.indexOf("WITH stale AS (");
-  const claimStart = migration.search(/RETURN QUERY\\s+WITH candidates AS \\(/);
+  const claimStart = migration.indexOf("RETURN QUERY", cleanupStart);
   assert.ok(cleanupStart > 0, "queue cleanup must exist");
   assert.ok(claimStart > cleanupStart, "cleanup must execute before the next delivery claim");
   const cleanup = migration.slice(cleanupStart, claimStart);
