@@ -4,16 +4,19 @@ const [
   { recoverManagedSessions, shutdownManagedSessions },
   { markRuntimeReady, markRuntimeNotReady },
   { writeSystemLog },
+  { startN8nDeliveryWorker },
 ] = await Promise.all([
   import("./src/app.js"),
   import("./src/config.js"),
   import("./src/whatsapp/restartRecovery.js"),
   import("./src/runtimeReadiness.js"),
   import("./src/systemLog.js"),
+  import("./src/n8nDeliveryWorker.js"),
 ]);
 
 const app = createApp();
 let shuttingDown = false;
+let stopN8nDeliveryWorker = () => {};
 
 process.on("uncaughtExceptionMonitor", (error, origin) => {
   console.error(`[runtime] uncaught exception (${origin}):`, error);
@@ -50,6 +53,7 @@ const server = app.listen(PORT, async () => {
   try {
     const results = await recoverManagedSessions();
     markRuntimeReady();
+    stopN8nDeliveryWorker = startN8nDeliveryWorker();
     console.log(
       `[whatsapp] restart recovery complete for ${results.length} durable session(s)`
     );
@@ -82,6 +86,7 @@ async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   markRuntimeNotReady();
+  stopN8nDeliveryWorker();
 
   console.log(`[runtime] ${signal} received, closing transports without logout`);
   void writeSystemLog({
