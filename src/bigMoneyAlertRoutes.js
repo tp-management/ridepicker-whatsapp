@@ -105,17 +105,22 @@ export function createBigMoneyAlertRouter({
       }
 
       // Snapshot the original DB message, never text supplied by the caller.
-      const sessions = await select("whatsapp_sessions", {
-        select: "id", user_id: "eq." + userId, limit: 1,
-      });
-      if (!sessions.length) return res.status(404).json({ error: "WhatsApp session not found" });
+      // A user can have historical/relinked WhatsApp sessions. Look up the
+      // specific message, then verify ownership of its actual session instead
+      // of assuming the user's first session owns every message.
       const source = await select("messages", {
-        select: "id,body",
-        id: "eq." + messageId,
-        session_id: "eq." + sessions[0].id,
-        limit: 1,
+        select: "id,body,session_id", id: "eq." + messageId, limit: 1,
       });
       if (!source.length || typeof source[0].body !== "string" || !source[0].body.trim()) {
+        return res.status(404).json({ error: "Original WhatsApp text not found" });
+      }
+      const ownedSession = await select("whatsapp_sessions", {
+        select: "id",
+        id: "eq." + source[0].session_id,
+        user_id: "eq." + userId,
+        limit: 1,
+      });
+      if (!ownedSession.length) {
         return res.status(404).json({ error: "Original WhatsApp text not found" });
       }
 
