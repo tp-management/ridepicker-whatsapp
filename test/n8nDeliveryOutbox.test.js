@@ -78,12 +78,60 @@ test("5xx response schedules retry; no AI processing state is changed", async ()
   assert.equal(patches[0].processing_status, undefined);
 });
 
-test("permanent 4xx and attempt limit stop automatic delivery", () => {
+test("temporarily inactive n8n webhook (404) retries instead of dying on first attempt", async () => {
   const base = { now: new Date("2026-10-28T00:00:00.000Z"), random: () => 0 };
-  assert.equal(nextN8nDeliveryState({ ...base, attemptCount: 1, httpStatus: 401 }).n8n_delivery_status, "dead");
-  assert.equal(nextN8nDeliveryState({ ...base, attemptCount: 1, httpStatus: 429 }).n8n_delivery_status, "retry");
-  assert.equal(nextN8nDeliveryState({ ...base, attemptCount: 8 }).n8n_delivery_status, "dead");
-  assert.equal(nextN8nDeliveryState({ ...base, attemptCount: 8 }).n8n_next_attempt_at, null);
+  assert.deepEqual(
+    (({ n8n_delivery_status, n8n_next_attempt_at }) => ({
+      n8n_delivery_status, n8n_next_attempt_at,
+    }))(nextN8nDeliveryState({ ...base, attemptCount: 1, httpStatus: 404 })),
+    { n8n_delivery_status: "retry", n8n_next_attempt_at: "2026-10-28T00:00:02.000Z" },
+  );
+  assert.equal(nextN8nDeliveryState({ ...base, attemptCount: 7, httpStatus: 404 }).n8n_delivery_status, "retry");
+  assert.equal(nextN8nDeliveryState({ ...base, attemptCount: 8, httpStatus: 404 }).n8n_delivery_status, "dead");
+
+  const updates = [];
+  const worker = createN8nDeliveryWorker({
+    webhookUrl: "https://n8n.example/webhook/messages/process",
+    claim: async () => [message],
+    update: async (_table, patch) => { updates.push(patch); return [{ id: message.id }]; },
+    fetchImpl: async () => ({ ok: false, status: 404 }),
+    now: () => base.now,
+    random: base.random,
+    logger: noopLogger,
+  });
+  await worker.processOnce();
+  assert.equal(updates[0].n8n_delivery_status, "retry");
+  assert.equal(updates[0].n8n_last_error, "n8n returned HTTP 404");
+});
+
+test("401/403 retry with longer delays but stop after five attempts", () => {
+  const base = { now: new Date("2026-10-28T00:00:00.000Z"), random: () => 0 };
+  for (const httpStatus of [401, 403]) {
+    const first = nextN8nDeliveryState({ ...base, attemptCount: 1, httpStatus });
+    assert.equal(first.n8n_delivery_status, "retry");
+    assert.equal(first.n8n_next_attempt_at, "2026-10-28T00:00:30.000Z");
+    const fourth = nextN8nDeliveryState({ ...base, attemptCount: 4, httpStatus });
+    assert.equal(fourth.n8n_delivery_status, "retry");
+    assert.equal(fourth.n8n_next_attempt_at, "2026-10-28T00:04:00.000Z");
+    const fifth = nextN8nDeliveryState({ ...base, attemptCount: 5, httpStatus });
+    assert.equal(fifth.n8n_delivery_status, "dead");
+    assert.equal(fifth.n8n_next_attempt_at, null);
+  }
+});
+
+test("bad payload 400/422 die early, while transient failures retry up to max attempts", () => {
+  const base = { now: new Date("2026-10-28T00:00:00.000Z"), random: () => 0 };
+  for (const httpStatus of [400, 422]) {
+    const outcome = nextN8nDeliveryState({ ...base, attemptCount: 1, httpStatus });
+    assert.equal(outcome.n8n_delivery_status, "dead");
+    assert.equal(outcome.n8n_next_attempt_at, null);
+  }
+  for (const httpStatus of [408, 429, 500, 502, 503, null]) {
+    assert.equal(nextN8nDeliveryState({ ...base, attemptCount: 1, httpStatus }).n8n_delivery_status, "retry");
+    const exhausted = nextN8nDeliveryState({ ...base, attemptCount: 8, httpStatus });
+    assert.equal(exhausted.n8n_delivery_status, "dead");
+    assert.equal(exhausted.n8n_next_attempt_at, null);
+  }
 });
 
 test("worker never claims anything if no webhook URL is configured", async () => {
