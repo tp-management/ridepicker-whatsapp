@@ -14,8 +14,6 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 
 import {
-  N8N_FORWARD_MEDIA_WITHOUT_TEXT,
-  N8N_FORWARD_FROM_ME,
   N8N_FORWARD_SESSION_EVENTS,
   N8N_WEBHOOK_URL,
   SESSION_POLICY_CACHE_MS,
@@ -1511,6 +1509,9 @@ async function processMessage(session, socket, message) {
     chatName = senderName;
   }
 
+  // A permitted original message and its outbox entry are one atomic INSERT.
+  // Outgoing/non-text history is retained but never queued for AI.
+  const eligibleForAi = !fromMe && Boolean(String(body || "").trim());
   let inserted = null;
 
   try {
@@ -1528,11 +1529,10 @@ async function processMessage(session, socket, message) {
       has_media: Boolean(media),
       media,
       message_timestamp: messageTimestamp,
-      processing_status:
-        fromMe && !N8N_FORWARD_FROM_ME ? "ignored" : "new",
+      processing_status: eligibleForAi ? "new" : "ignored",
+      n8n_delivery_status: eligibleForAi ? "pending" : null,
     });
   } catch (error) {
-    // The DB trigger is our second line of defence against OFF/history messages.
     console.error(
       `[${session.id}] message insert rejected:`,
       error.message
@@ -1540,11 +1540,9 @@ async function processMessage(session, socket, message) {
     return;
   }
 
-  // Ignore duplicates. PostgREST returns no inserted row when
-  // resolution=ignore-duplicates matched the unique constraint.
-  if (!inserted) {
-    return;
-  }
+  // Insert returned no row: WhatsApp ID replay, blocked sender, or OFF/history
+  // storage guard. The delivery worker can only claim committed new rows.
+  if (!inserted) return;
 
   maybeUpsertChat({
     sessionId: session.id,
@@ -1563,56 +1561,8 @@ async function processMessage(session, socket, message) {
     body || `[${messageType}]`
   );
 
-  // By default outgoing messages are context-only. For temporary testing,
-  // N8N_FORWARD_FROM_ME=true also forwards manually sent messages to n8n.
-  // IMPORTANT: turn this back off before automated replies/autopilot are enabled
-  // to avoid feeding bot-generated outbound messages back into the AI pipeline.
-  if (fromMe && !N8N_FORWARD_FROM_ME) {
-    return;
-  }
-
-  const hasText = Boolean(String(body || "").trim());
-
-  if (!hasText && !N8N_FORWARD_MEDIA_WITHOUT_TEXT) {
-    await repository.updateMessage(inserted.id, {
-      processing_status: "ignored",
-    });
-    return;
-  }
-
-  const event = {
-    event: "message.received",
-    userId: policy.user_id,
-    session: session.id,
-    timestamp: Date.now(),
-    payload: {
-      id: whatsappMessageId,
-      dbMessageId: inserted.id,
-      chatId,
-      chatName,
-      isGroup,
-      sender,
-      senderName,
-      participant,
-      participantAlt,
-      fromMe,
-      direction: fromMe ? "outgoing" : "incoming",
-      body,
-      type: messageType,
-      hasMedia: Boolean(media),
-      media,
-      messageTimestamp,
-    },
-  };
-
-  const delivered = await sendToN8n(event);
-
-  if (delivered) {
-    await repository.updateMessage(inserted.id, {
-      processing_status: "sent_to_ai",
-      forwarded_to_n8n_at: new Date().toISOString(),
-    });
-  }
+  // No direct webhook POST here: the outbox worker owns retries, leases
+  // and delivery acknowledgement after the DB insert has committed.
 }
 
 export function getSession(id) {
