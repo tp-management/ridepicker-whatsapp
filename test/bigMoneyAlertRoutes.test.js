@@ -30,11 +30,14 @@ async function fixture(t, { configured = true, internalKey = "test-secret" } = {
         .filter((row) => row.user_id === query.user_id.slice(3) && row.status === query.status.slice(3))
         .sort((a, b) => a.id - b.id)
         .slice(0, query.limit);
-      if (table === "whatsapp_sessions") return query.user_id === "eq." + OWNER ? [{ id: "session-1" }] : [];
+      if (table === "whatsapp_sessions") {
+        return query.user_id === "eq." + OWNER &&
+          query.id === "eq.session-2" ? [{ id: "session-2" }] : [];
+      }
       if (table === "messages") {
-        return query.id === "eq.42" && query.session_id === "eq.session-1"
-          ? [{ id: 42, body: TEXT }]
-          : [];
+        if (query.id === "eq.42") return [{ id: 42, session_id: "session-2", body: TEXT }];
+        if (query.id === "eq.77") return [{ id: 77, session_id: "other-users-session", body: TEXT }];
+        return [];
       }
       throw Error("Unexpected table " + table);
     },
@@ -90,7 +93,7 @@ test("GET lists only this user's pending alerts and preserves raw original body"
   assert.equal((await f.request("/api/users/not-a-user/big-money-alerts")).status, 404);
 });
 
-test("internal queue requires key, takes original DB body, ignores duplicates", async (t) => {
+test("internal queue requires key, verifies owning session, preserves raw body and ignores duplicates", async (t) => {
   const f = await fixture(t);
   const path = "/internal/big-money-alerts";
   const body = { userId: OWNER, messageId: 42, originalMessage: "FAKE TEXT MUST NOT BE USED" };
@@ -106,8 +109,11 @@ test("internal queue requires key, takes original DB body, ignores duplicates", 
   assert.deepEqual(await duplicate.json(), { ok: true, created: false });
   assert.equal(f.alerts.length, 2);
   assert.equal(f.notifications.length, 1);
+  // Never leak messages from another user's WhatsApp session.
   assert.equal((await f.request(path, "POST", { userId: OTHER, messageId: 42 }, headers)).status, 404);
+  assert.equal((await f.request(path, "POST", { userId: OWNER, messageId: 77 }, headers)).status, 404);
   assert.equal((await f.request(path, "POST", { userId: OWNER, messageId: 0 }, headers)).status, 400);
+  assert.equal(f.alerts.length, 2, "Foreign session must not create a new alert");
 });
 
 test("DECLINE removes from pending only, preserves decision history; repeat is conflict", async (t) => {
