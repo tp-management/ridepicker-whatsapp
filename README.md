@@ -43,7 +43,7 @@ When RidePicker mode is `assist`:
 - duplicate WhatsApp message IDs are ignored
 - messages older than `bot_enabled_at` are ignored
 - system/protocol/reaction events are ignored
-- outgoing (`from_me`) messages are stored for conversation context but are **not** forwarded to n8n
+- outgoing (`from_me`) messages are saved for context; they are queued for n8n only when `N8N_FORWARD_FROM_ME=true` (default `false`). This includes ordinary manual outgoing and self-chat messages, without special text prefixes. Replies sent by RidePicker's `/send` endpoint are excluded from n8n delivery to prevent loops
 - incoming text/caption messages are forwarded to n8n exactly once after a successful DB insert
 - media-only messages are stored but are not sent to n8n by default
 - session lifecycle events are not sent to n8n by default
@@ -115,6 +115,7 @@ N8N_WEBHOOK_URL=...
 FRONTEND_ORIGINS=https://ride-picker.web.app
 N8N_FORWARD_SESSION_EVENTS=false
 N8N_FORWARD_MEDIA_WITHOUT_TEXT=false
+N8N_FORWARD_FROM_ME=false
 SESSION_POLICY_CACHE_MS=5000
 ```
 
@@ -230,6 +231,13 @@ Only a newly stored incoming message is sent by default:
 ```
 
 `dbMessageId` is important: n8n can use it as `source_message_id` when creating a parsed job.
+
+
+### Test with your own WhatsApp account
+
+When `N8N_FORWARD_FROM_ME=true` on the backend, send any new text in WhatsApp **Message yourself**, for example `LHR to Mayfair £950 ASAP`, while RidePicker Assist is ON. The original message enters the normal `messages` RAW + n8n outbox pipeline; no `#rp-test` marker is needed. This flag also forwards your **other manually sent** text/caption messages, so leave it disabled outside testing unless that is intentional. Changes to Railway environment variables require a redeploy/restart; `N8N_WEBHOOK_URL` must point to the active production webhook.
+
+The transport's `n8n_delivery_status=delivered` confirms n8n acceptance only. It must not set AI `processing_status=parsed`.
 
 ## n8n job creation helper
 
