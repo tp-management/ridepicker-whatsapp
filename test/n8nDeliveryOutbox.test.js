@@ -161,6 +161,33 @@ test("outbox migration preserves permitted RAW messages and limits claim ownersh
   assert.match(migration, /forwarded_to_n8n_at IS NOT NULL AND n8n_delivery_status IS NULL/i);
 });
 
+test("OFF and re-enabled policies terminally skip queued messages without deleting RAW history", async () => {
+  const migration = await readFile(
+    "supabase/migrations/20261028_raw_message_n8n_delivery_outbox.sql", "utf8"
+  );
+  assert.match(migration, /'pending','delivering','delivered','retry','dead','skipped'/i);
+  assert.match(migration, /ADD COLUMN IF NOT EXISTS n8n_skipped_at timestamptz/i);
+  assert.match(migration, /ADD COLUMN IF NOT EXISTS n8n_skip_reason text/i);
+  const cleanupStart = migration.indexOf("WITH stale AS (");
+  const claimStart = migration.indexOf("RETURN QUERY\\n  WITH candidates AS (");
+  assert.ok(cleanupStart > 0, "queue cleanup must exist");
+  assert.ok(claimStart > cleanupStart, "cleanup must execute before the next delivery claim");
+  const cleanup = migration.slice(cleanupStart, claimStart);
+  assert.match(cleanup, /ws\.bot_mode\s*=\s*'off'/i);
+  assert.match(cleanup, /m\.message_timestamp\s*<\s*ws\.bot_enabled_at/i);
+  assert.match(cleanup, /m\.n8n_delivery_status IN \('pending','retry'\)/i);
+  assert.match(cleanup, /m\.n8n_delivery_status = 'delivering'/i);
+  assert.match(cleanup, /m\.n8n_locked_at\s*<\s*now\(\)\s*-\s*make_interval/i);
+  assert.match(cleanup, /FOR UPDATE OF m SKIP LOCKED/i);
+  assert.match(cleanup, /LIMIT 100/i);
+  assert.match(cleanup, /n8n_delivery_status\s*=\s*'skipped'/i);
+  assert.match(cleanup, /n8n_next_attempt_at\s*=\s*NULL/i);
+  assert.match(cleanup, /n8n_locked_by\s*=\s*NULL/i);
+  assert.match(cleanup, /n8n_skip_reason\s*=\s*stale\.reason/i);
+  assert.doesNotMatch(cleanup, /DELETE FROM public\.messages/i);
+  assert.doesNotMatch(cleanup, /processing_status\s*=/i);
+});
+
 test("WhatsApp notification handler persists RAW and pending in one insert", async () => {
   const source = await readFile("src/whatsapp.js", "utf8");
   const begin = source.indexOf("async function processMessage(");
