@@ -8,7 +8,7 @@ import {
 
 const noopLogger = { info() {}, warn() {}, error() {} };
 const message = {
-  id: 1234,
+  id: "1234",
   user_id: "user-1",
   session_id: "session-1",
   whatsapp_message_id: "WA-1234",
@@ -47,7 +47,7 @@ test("2xx n8n ACK marks only delivery as delivered, keeping AI progress separate
   assert.equal(seen.calls[0].url, "https://n8n.example/webhook/messages/process");
   assert.equal(seen.calls[0].options.headers["X-RidePicker-Message-Id"], "1234");
   const payload = JSON.parse(seen.calls[0].options.body);
-  assert.equal(payload.message_id, 1234);
+  assert.equal(payload.message_id, "1234");
   assert.equal(payload.user_id, "user-1");
   assert.equal(payload.body, "CM24 1QW to KY16\n£950");
   assert.deepEqual(seen.updates[0].filter, {
