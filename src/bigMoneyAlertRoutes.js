@@ -46,7 +46,7 @@ router.patch("/api/users/:userId/big-money-alerts/:alertId", requireUser, async 
     if (!["accept", "decline"].includes(decision)) {
       return res.status(400).json({ error: "decision must be accept or decline" });
     }
-    if (!/^\\d+$/.test(String(req.params.alertId))) {
+    if (!/^\d+$/.test(String(req.params.alertId))) {
       return res.status(400).json({ error: "invalid alert id" });
     }
     const status = decision === "accept" ? "accepted" : "declined";
