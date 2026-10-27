@@ -1,6 +1,8 @@
 import express from "express";
 import { repository } from "./repository.js";
-import { isSupabaseConfigured, selectRows, updateRows } from "./supabase.js";
+import { isSupabaseConfigured, selectRows, updateRows, insertRows } from "./supabase.js";
+import { INTERNAL_API_KEY } from "./config.js";
+import { publishUserChange } from "./liveEvents.js";
 
 const router = express.Router();
 
@@ -57,6 +59,48 @@ router.patch("/api/users/:userId/big-money-alerts/:alertId", requireUser, async 
     if (!rows.length) return res.status(409).json({ error: "alert already handled or unavailable" });
     // X (future accept action) intentionally not implemented.
     res.json({ alert: { id: String(rows[0].id), status } });
+  } catch (error) { fail(res, error); }
+});
+
+
+function requireInternal(req, res, next) {
+  const key = req.get("x-api-key") || req.get("x-ridepicker-key");
+  if (!INTERNAL_API_KEY || !key || key !== INTERNAL_API_KEY) {
+    return res.status(401).json({ error: "internal authorization required" });
+  }
+  next();
+}
+
+// Future n8n detector writes a new alert by referencing an existing stored
+// WhatsApp message. Never accept fabricated message text from the caller.
+router.post("/internal/big-money-alerts", requireInternal, async (req, res) => {
+  try {
+    if (!isSupabaseConfigured()) return res.status(503).json({ error: "Supabase is not configured" });
+    const userId = String(req.body?.userId || "");
+    const messageId = String(req.body?.messageId || "");
+    if (!userId || !/^\d+$/.test(messageId)) {
+      return res.status(400).json({ error: "userId and numeric messageId are required" });
+    }
+    const sessions = await selectRows("whatsapp_sessions", { select: "id", user_id: `eq.${userId}`, limit: 1 });
+    if (!sessions.length) return res.status(404).json({ error: "WhatsApp session not found" });
+    const source = await selectRows("messages", {
+      select: "id,body",
+      id: `eq.${messageId}`,
+      session_id: `eq.${sessions[0].id}`,
+      limit: 1,
+    });
+    if (!source.length || !String(source[0].body || "").trim()) {
+      return res.status(404).json({ error: "Original WhatsApp text not found" });
+    }
+    const rows = await insertRows("big_money_alerts", [{
+      user_id: userId, source_message_id: source[0].id,
+      original_message: source[0].body,
+    }], {
+      query: { on_conflict: "user_id,source_message_id" },
+      prefer: "resolution=ignore-duplicates,return=representation",
+    });
+    publishUserChange(userId, ["big_money_alerts"], "big_money_alert_received");
+    return res.status(rows.length ? 201 : 200).json({ ok: true });
   } catch (error) { fail(res, error); }
 });
 
