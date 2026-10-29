@@ -1,6 +1,5 @@
 import express from "express";
-import { repository } from "./repository.js";
-import { insertRows, deleteRows, isSupabaseConfigured } from "./supabase.js";
+import { insertRows, deleteRows, selectRows, isSupabaseConfigured } from "./supabase.js";
 import { pushConfigured, pushConfiguration, validPushEndpoint } from "./pushNotifications.js";
 import { authorizePushUser, startPushPhoneOtp, verifyPushPhoneOtp } from "./pushAuth.js";
 
@@ -19,7 +18,16 @@ export function allowOtpAttempt(key, now = Date.now()) {
 }
 
 export function createPushRouter({
-  findUser = (id) => repository.getUserById(id),
+  // The normal public user API intentionally maps phone_e164 -> phone;
+  // auth must read the raw verified phone and auth_user_id from the DB.
+  findUser = async (id) => {
+    const rows = await selectRows("users", {
+      select: "id,phone_e164,auth_user_id",
+      id: "eq." + id,
+      limit: 1,
+    });
+    return rows[0] || null;
+  },
   insert = insertRows,
   remove = deleteRows,
   configured = isSupabaseConfigured,
