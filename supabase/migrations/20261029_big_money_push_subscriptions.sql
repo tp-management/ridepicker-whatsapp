@@ -20,7 +20,7 @@ create table if not exists public.push_deliveries (
   status text not null default 'pending'
     check (status in ('pending','sending','retry','delivered','skipped','dead')),
   attempt_count integer not null default 0 check (attempt_count >= 0),
-  next_attempt_at timestamptz not null default now(),
+  next_attempt_at timestamptz default now(),
   locked_at timestamptz,
   locked_by uuid,
   last_error text,
