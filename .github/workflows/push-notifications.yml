@@ -1,0 +1,26 @@
+name: BIG MONEY Web Push tests
+on:
+  pull_request:
+    paths:
+      - "src/pushAuth.js"
+      - "src/pushRoutes.js"
+      - "src/pushNotifications.js"
+      - "src/pushDeliveryWorker.js"
+      - "src/bigMoneyAlertRoutes.js"
+      - "supabase/migrations/20261029_big_money_push_subscriptions.sql"
+      - "test/push*.test.js"
+      - ".github/workflows/push-notifications.yml"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci
+      - run: node --check src/pushAuth.js && node --check src/pushRoutes.js && node --check src/pushDeliveryWorker.js
+      - run: node --test test/pushNotifications.test.js test/pushAuth.test.js test/pushRoutes.test.js test/pushDeliveryWorker.test.js test/bigMoneyAlertRoutes.test.js
