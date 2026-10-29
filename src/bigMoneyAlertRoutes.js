@@ -3,6 +3,7 @@ import { repository } from "./repository.js";
 import { isSupabaseConfigured, selectRows, updateRows, insertRows } from "./supabase.js";
 import { INTERNAL_API_KEY } from "./config.js";
 import { publishUserChange } from "./liveEvents.js";
+import { sendBigMoneyNotifications } from "./pushNotifications.js";
 
 const numericId = (value) => /^[1-9]\d*$/.test(String(value ?? ""));
 
@@ -29,6 +30,7 @@ export function createBigMoneyAlertRouter({
   update = updateRows,
   insert = insertRows,
   publish = publishUserChange,
+  notify = sendBigMoneyNotifications,
   internalKey = INTERNAL_API_KEY,
 } = {}) {
   const router = express.Router();
@@ -131,7 +133,15 @@ export function createBigMoneyAlertRouter({
         prefer: "resolution=ignore-duplicates,return=representation",
       });
       // No replay/notification for duplicate or previously processed alert.
-      if (rows.length) publish(userId, ["big_money_alerts"], "big_money_alert_received");
+      if (rows.length) {
+        publish(userId, ["big_money_alerts"], "big_money_alert_received");
+        // Push is best effort: a delivered DB alert must not fail because a device is offline.
+        try {
+          await notify(userId);
+        } catch (pushError) {
+          console.warn("[big-money-push] notification dispatch failed:", pushError?.message || pushError);
+        }
+      }
       res.status(rows.length ? 201 : 200).json({ ok: true, created: rows.length > 0 });
     } catch (error) { fail(res, error); }
   });
