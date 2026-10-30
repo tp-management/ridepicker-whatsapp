@@ -5,6 +5,7 @@ const [
   { markRuntimeReady, markRuntimeNotReady },
   { writeSystemLog },
   { startN8nDeliveryWorker },
+  { startBigMoneyPushWorker },
 ] = await Promise.all([
   import("./src/app.js"),
   import("./src/config.js"),
@@ -12,11 +13,13 @@ const [
   import("./src/runtimeReadiness.js"),
   import("./src/systemLog.js"),
   import("./src/n8nDeliveryWorker.js"),
+  import("./src/bigMoneyPushWorker.js"),
 ]);
 
 const app = createApp();
 let shuttingDown = false;
 let stopN8nDeliveryWorker = () => {};
+let stopBigMoneyPushWorker = () => {};
 
 process.on("uncaughtExceptionMonitor", (error, origin) => {
   console.error(`[runtime] uncaught exception (${origin}):`, error);
@@ -49,6 +52,9 @@ const server = app.listen(PORT, async () => {
       supabaseConfigured: SUPABASE_CONFIGURED,
     },
   });
+
+  // BIG MONEY reminders continue independently of WhatsApp restart recovery.
+  if (SUPABASE_CONFIGURED) stopBigMoneyPushWorker = startBigMoneyPushWorker();
 
   try {
     const results = await recoverManagedSessions();
@@ -87,6 +93,7 @@ async function shutdown(signal) {
   shuttingDown = true;
   markRuntimeNotReady();
   stopN8nDeliveryWorker();
+  stopBigMoneyPushWorker();
 
   console.log(`[runtime] ${signal} received, closing transports without logout`);
   void writeSystemLog({
