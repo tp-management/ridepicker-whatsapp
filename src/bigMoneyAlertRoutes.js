@@ -1,9 +1,10 @@
 import express from "express";
 import { repository } from "./repository.js";
-import { isSupabaseConfigured, selectRows, updateRows, insertRows } from "./supabase.js";
+import { isSupabaseConfigured, selectRows, updateRows, insertRows, callRpc } from "./supabase.js";
 import { INTERNAL_API_KEY } from "./config.js";
 import { publishUserChange } from "./liveEvents.js";
 import { sendBigMoneyPush } from "./webPush.js";
+import { processBigMoneyPushActions } from "./bigMoneyPushWorker.js";
 
 const numericId = (value) => /^[1-9]\d*$/.test(String(value ?? ""));
 
@@ -34,6 +35,7 @@ export function createBigMoneyAlertRouter({
   insert = insertRows,
   publish = publishUserChange,
   notify = sendBigMoneyPush,
+  claim = (args) => callRpc("claim_big_money_push_actions", args),
   internalKey = INTERNAL_API_KEY,
   webhookSecret = process.env.BIG_MONEY_WEBHOOK_SECRET || "",
 } = {}) {
@@ -128,13 +130,13 @@ export function createBigMoneyAlertRouter({
         return res.json({ ok: true, ignored: true });
       }
 
-      publish(rows[0].user_id, ["big_money_alerts"], "big_money_alert_received");
-      try {
-        await notify(rows[0].user_id);
-      } catch (error) {
-        console.warn("[big-money-push] Delivery unavailable:", error?.message || error);
-      }
-      return res.json({ ok: true });
+      const result = await processBigMoneyPushActions({
+        alertId: rows[0].id,
+        claim,
+        notify,
+        publish,
+      });
+      return res.json(result.claimed ? { ok: true } : { ok: true, ignored: true });
     } catch (error) { return fail(res, error); }
   });
 

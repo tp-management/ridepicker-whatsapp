@@ -27,6 +27,12 @@ async function fixture(t, { configured = true, internalKey = "test-secret", webh
     webhookSecret,
     publish: (...args) => notifications.push(args),
     notify: async (userId) => pushes.push(userId),
+    claim: async ({ p_alert_id }) => {
+      const row = alerts.find((a) => String(a.id) === String(p_alert_id));
+      if (!row || row.status !== "pending" || row.push_attempts) return [];
+      row.push_attempts = 1;
+      return [{ alert_id: row.id, user_id: row.user_id, action: "send", attempt_number: 1 }];
+    },
     select: async (table, query) => {
       calls.push({ method: "select", table, query });
       if (table === "big_money_alerts") return alerts
