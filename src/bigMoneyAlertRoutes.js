@@ -7,6 +7,9 @@ import { sendBigMoneyPush } from "./webPush.js";
 
 const numericId = (value) => /^[1-9]\d*$/.test(String(value ?? ""));
 
+const uuidId = (value) =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(value ?? ""));
+
 export function bigMoneyDecisionStatus(value) {
   if (value === "accept") return "accepted";
   if (value === "decline") return "declined";
@@ -32,6 +35,7 @@ export function createBigMoneyAlertRouter({
   publish = publishUserChange,
   notify = sendBigMoneyPush,
   internalKey = INTERNAL_API_KEY,
+  webhookSecret = process.env.BIG_MONEY_WEBHOOK_SECRET || "",
 } = {}) {
   const router = express.Router();
 
@@ -97,6 +101,43 @@ export function createBigMoneyAlertRouter({
     next();
   }
 
+  // The database INSERT is the Push trigger, independent of n8n.
+  router.post("/internal/big-money-inserted", async (req, res) => {
+    const secret = req.get("x-ridepicker-webhook-key");
+    if (!webhookSecret || !secret || secret !== webhookSecret) {
+      return res.status(401).json({ error: "webhook authorization required" });
+    }
+
+    const payload = req.body;
+    const record = payload?.record;
+    if (payload?.type !== "INSERT" || payload?.schema !== "public"
+      || payload?.table !== "big_money_alerts"
+      || !numericId(record?.id) || !uuidId(record?.user_id)) {
+      return res.status(400).json({ error: "invalid BIG MONEY webhook" });
+    }
+
+    try {
+      // Verify the committed DB row. Never trust webhook-supplied job text.
+      const rows = await select("big_money_alerts", {
+        select: "id,user_id,status",
+        id: "eq." + record.id,
+        user_id: "eq." + record.user_id,
+        limit: 1,
+      });
+      if (!rows.length || rows[0].status !== "pending") {
+        return res.json({ ok: true, ignored: true });
+      }
+
+      publish(rows[0].user_id, ["big_money_alerts"], "big_money_alert_received");
+      try {
+        await notify(rows[0].user_id);
+      } catch (error) {
+        console.warn("[big-money-push] Delivery unavailable:", error?.message || error);
+      }
+      return res.json({ ok: true });
+    } catch (error) { return fail(res, error); }
+  });
+
   router.post("/internal/big-money-alerts", requireInternal, async (req, res) => {
     try {
       if (!configured()) return res.status(503).json({ error: "Supabase is not configured" });
@@ -135,12 +176,7 @@ export function createBigMoneyAlertRouter({
       // No replay/notification for duplicate or previously processed alert.
       if (rows.length) {
         publish(userId, ["big_money_alerts"], "big_money_alert_received");
-        // Only newly inserted alerts trigger a push. Failure never deletes the job.
-        try {
-          await notify(userId);
-        } catch (error) {
-          console.warn("[big-money-push] Delivery unavailable:", error?.message || error);
-        }
+        // The Supabase INSERT webhook handles Push for every new row.
       }
       res.status(rows.length ? 201 : 200).json({ ok: true, created: rows.length > 0 });
     } catch (error) { fail(res, error); }
