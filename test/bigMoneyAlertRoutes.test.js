@@ -7,7 +7,7 @@ const OWNER = "11111111-1111-4111-8111-111111111111";
 const OTHER = "22222222-2222-4222-8222-222222222222";
 const TEXT = "🚕 Driver needed ASAP!\n  Airport → Centre\n£950\n\nSame-day payment\n";
 
-async function fixture(t, { configured = true, internalKey = "test-secret" } = {}) {
+async function fixture(t, { configured = true, internalKey = "test-secret", webhookSecret = "test-webhook-secret" } = {}) {
   let nextId = 2;
   const alerts = [{
     id: 1,
@@ -24,12 +24,15 @@ async function fixture(t, { configured = true, internalKey = "test-secret" } = {
     configured: () => configured,
     findUser: async (id) => [OWNER, OTHER].includes(id) ? { id } : null,
     internalKey,
+    webhookSecret,
     publish: (...args) => notifications.push(args),
     notify: async (userId) => pushes.push(userId),
     select: async (table, query) => {
       calls.push({ method: "select", table, query });
       if (table === "big_money_alerts") return alerts
-        .filter((row) => row.user_id === query.user_id.slice(3) && row.status === query.status.slice(3))
+        .filter((row) => row.user_id === query.user_id.slice(3)
+          && (query.status == null || row.status === query.status.slice(3))
+          && (query.id == null || String(row.id) === query.id.slice(3)))
         .sort((a, b) => a.id - b.id)
         .slice(0, query.limit);
       if (table === "whatsapp_sessions") {
@@ -106,13 +109,13 @@ test("internal queue requires key, verifies owning session, preserves raw body a
   assert.deepEqual(await first.json(), { ok: true, created: true });
   assert.equal(f.alerts[1].original_message, TEXT);
   assert.equal(f.notifications.length, 1);
-  assert.deepEqual(f.pushes, [OWNER]);
+  assert.deepEqual(f.pushes, [], "n8n creates the row; only the DB webhook sends Push");
   const duplicate = await f.request(path, "POST", body, headers);
   assert.equal(duplicate.status, 200);
   assert.deepEqual(await duplicate.json(), { ok: true, created: false });
   assert.equal(f.alerts.length, 2);
   assert.equal(f.notifications.length, 1);
-  assert.deepEqual(f.pushes, [OWNER], "Duplicate must not send another push");
+  assert.deepEqual(f.pushes, [], "n8n never sends Push directly");
   // Never leak messages from another user's WhatsApp session.
   assert.equal((await f.request(path, "POST", { userId: OTHER, messageId: 42 }, headers)).status, 404);
   assert.equal((await f.request(path, "POST", { userId: OWNER, messageId: 77 }, headers)).status, 404);
@@ -150,4 +153,36 @@ test("ACCEPT records only accepted status, enforces ownership and validates deci
 test("backend unconfigured rejects account reads", async (t) => {
   const f = await fixture(t, { configured: false });
   assert.equal((await f.request("/api/users/" + OWNER + "/big-money-alerts")).status, 503);
+});
+
+test("DB INSERT webhook verifies the actual row and sends Push to its owner", async (t) => {
+  const f = await fixture(t);
+  const path = "/internal/big-money-inserted";
+  const headers = { "x-ridepicker-webhook-key": "test-webhook-secret" };
+  const payload = { type: "INSERT", schema: "public", table: "big_money_alerts",
+    record: { id: 1, user_id: OWNER, original_message: "untrusted" } };
+  assert.equal((await f.request(path, "POST", payload)).status, 401);
+  assert.equal((await f.request(path, "POST", payload, { "x-ridepicker-webhook-key": "bad" })).status, 401);
+  assert.equal((await f.request(path, "POST", { ...payload, type: "UPDATE" }, headers)).status, 400);
+  assert.equal((await f.request(path, "POST", { ...payload, record: { id: 1, user_id: OTHER } }, headers)).status, 200);
+  assert.deepEqual(f.pushes, []);
+
+  const accepted = await f.request(path, "POST", payload, headers);
+  assert.equal(accepted.status, 200);
+  assert.deepEqual(await accepted.json(), { ok: true });
+  assert.deepEqual(f.pushes, [OWNER]);
+  assert.deepEqual(f.notifications, [[OWNER, ["big_money_alerts"], "big_money_alert_received"]]);
+
+  f.alerts[0].status = "accepted";
+  assert.deepEqual(await (await f.request(path, "POST", payload, headers)).json(), { ok: true, ignored: true });
+  assert.deepEqual(f.pushes, [OWNER]);
+});
+
+test("DB webhook requires a configured secret", async (t) => {
+  const f = await fixture(t, { webhookSecret: "" });
+  const response = await f.request("/internal/big-money-inserted", "POST", {
+    type: "INSERT", schema: "public", table: "big_money_alerts",
+    record: { id: 1, user_id: OWNER },
+  }, { "x-ridepicker-webhook-key": "test-webhook-secret" });
+  assert.equal(response.status, 401);
 });
