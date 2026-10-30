@@ -18,12 +18,14 @@ async function fixture(t, { configured = true, internalKey = "test-secret" } = {
     created_at: "2026-10-27T13:00:00Z",
   }];
   const notifications = [];
+  const pushes = [];
   const calls = [];
   const services = {
     configured: () => configured,
     findUser: async (id) => [OWNER, OTHER].includes(id) ? { id } : null,
     internalKey,
     publish: (...args) => notifications.push(args),
+    notify: async (userId) => pushes.push(userId),
     select: async (table, query) => {
       calls.push({ method: "select", table, query });
       if (table === "big_money_alerts") return alerts
@@ -78,7 +80,7 @@ async function fixture(t, { configured = true, internalKey = "test-secret" } = {
     headers: { ...(body === undefined ? {} : { "content-type": "application/json" }), ...headers },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
-  return { alerts, notifications, calls, request };
+  return { alerts, notifications, pushes, calls, request };
 }
 
 test("GET lists only this user's pending alerts and preserves raw original body", async (t) => {
@@ -104,11 +106,13 @@ test("internal queue requires key, verifies owning session, preserves raw body a
   assert.deepEqual(await first.json(), { ok: true, created: true });
   assert.equal(f.alerts[1].original_message, TEXT);
   assert.equal(f.notifications.length, 1);
+  assert.deepEqual(f.pushes, [OWNER]);
   const duplicate = await f.request(path, "POST", body, headers);
   assert.equal(duplicate.status, 200);
   assert.deepEqual(await duplicate.json(), { ok: true, created: false });
   assert.equal(f.alerts.length, 2);
   assert.equal(f.notifications.length, 1);
+  assert.deepEqual(f.pushes, [OWNER], "Duplicate must not send another push");
   // Never leak messages from another user's WhatsApp session.
   assert.equal((await f.request(path, "POST", { userId: OTHER, messageId: 42 }, headers)).status, 404);
   assert.equal((await f.request(path, "POST", { userId: OWNER, messageId: 77 }, headers)).status, 404);

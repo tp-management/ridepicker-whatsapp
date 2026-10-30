@@ -3,6 +3,7 @@ import { repository } from "./repository.js";
 import { isSupabaseConfigured, selectRows, updateRows, insertRows } from "./supabase.js";
 import { INTERNAL_API_KEY } from "./config.js";
 import { publishUserChange } from "./liveEvents.js";
+import { sendBigMoneyPush } from "./webPush.js";
 
 const numericId = (value) => /^[1-9]\d*$/.test(String(value ?? ""));
 
@@ -29,6 +30,7 @@ export function createBigMoneyAlertRouter({
   update = updateRows,
   insert = insertRows,
   publish = publishUserChange,
+  notify = sendBigMoneyPush,
   internalKey = INTERNAL_API_KEY,
 } = {}) {
   const router = express.Router();
@@ -131,7 +133,15 @@ export function createBigMoneyAlertRouter({
         prefer: "resolution=ignore-duplicates,return=representation",
       });
       // No replay/notification for duplicate or previously processed alert.
-      if (rows.length) publish(userId, ["big_money_alerts"], "big_money_alert_received");
+      if (rows.length) {
+        publish(userId, ["big_money_alerts"], "big_money_alert_received");
+        // Only newly inserted alerts trigger a push. Failure never deletes the job.
+        try {
+          await notify(userId);
+        } catch (error) {
+          console.warn("[big-money-push] Delivery unavailable:", error?.message || error);
+        }
+      }
       res.status(rows.length ? 201 : 200).json({ ok: true, created: rows.length > 0 });
     } catch (error) { fail(res, error); }
   });
