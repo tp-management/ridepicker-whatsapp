@@ -192,3 +192,23 @@ test("DB webhook requires a configured secret", async (t) => {
   }, { "x-ridepicker-webhook-key": "test-webhook-secret" });
   assert.equal(response.status, 401);
 });
+
+
+test("BIG MONEY ingest accepts only its configured key, not legacy /send credentials", async (t) => {
+  const f = await fixture(t, { internalKey: "big-money-n8n-only" });
+  const path = "/internal/big-money-alerts";
+  const body = { userId: OWNER, messageId: 42 };
+  assert.equal((await f.request(path, "POST", body)).status, 401);
+  assert.equal((await f.request(path, "POST", body, { "x-api-key": "legacy-other-key" })).status, 401);
+  const accepted = await f.request(path, "POST", body, { "x-api-key": "big-money-n8n-only" });
+  assert.equal(accepted.status, 201);
+  assert.deepEqual(await accepted.json(), { ok: true, created: true });
+});
+
+test("BIG MONEY ingest is disabled when no secret is configured", async (t) => {
+  const f = await fixture(t, { internalKey: "" });
+  const response = await f.request("/internal/big-money-alerts", "POST",
+    { userId: OWNER, messageId: 42 }, { "x-api-key": "any-value" });
+  assert.equal(response.status, 401);
+  assert.equal(f.alerts.length, 1);
+});

@@ -67,6 +67,10 @@ export const FRONTEND_ORIGINS = parseCsv(
 export const INTERNAL_API_KEY =
   process.env.INTERNAL_API_KEY || "";
 
+// Dedicated n8n BIG MONEY ingestion credential. Keeps legacy /send untouched.
+export const BIG_MONEY_INGEST_KEY =
+  process.env.BIG_MONEY_INGEST_KEY || "";
+
 export const SESSION_POLICY_CACHE_MS =
   Number(process.env.SESSION_POLICY_CACHE_MS) || 5000;
 
