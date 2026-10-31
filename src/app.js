@@ -17,6 +17,7 @@ import {
 } from "./observability.js";
 import userApiRouter from "./userApiRoutes.js";
 import managedDisconnectRouter from "./whatsapp/managedDisconnectRouter.js";
+import whatsappHistoryRouter from "./whatsapp/historyRouter.js";
 import router from "./routes.js";
 
 export function createApp() {
@@ -77,6 +78,7 @@ export function createApp() {
   app.use(pushRouter);
   app.use(userApiRouter);
   app.use(managedDisconnectRouter);
+  app.use(whatsappHistoryRouter);
   app.use(router);
 
   app.use((error, req, res, next) => {
