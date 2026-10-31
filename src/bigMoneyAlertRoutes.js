@@ -1,7 +1,7 @@
 import express from "express";
 import { repository } from "./repository.js";
 import { isSupabaseConfigured, selectRows, updateRows, insertRows, callRpc } from "./supabase.js";
-import { INTERNAL_API_KEY } from "./config.js";
+import { INTERNAL_API_KEY, BIG_MONEY_INGEST_KEY } from "./config.js";
 import { publishUserChange } from "./liveEvents.js";
 import { sendBigMoneyPush } from "./webPush.js";
 import { processBigMoneyPushActions } from "./bigMoneyPushWorker.js";
@@ -36,7 +36,8 @@ export function createBigMoneyAlertRouter({
   publish = publishUserChange,
   notify = sendBigMoneyPush,
   claim = (args) => callRpc("claim_big_money_push_actions", args),
-  internalKey = INTERNAL_API_KEY,
+  // Prefer an isolated BIG MONEY key; preserve existing deployments using INTERNAL_API_KEY.
+  internalKey = BIG_MONEY_INGEST_KEY || INTERNAL_API_KEY,
   webhookSecret = process.env.BIG_MONEY_WEBHOOK_SECRET || "",
 } = {}) {
   const router = express.Router();
