@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { createWhatsappHarnessFromSource } from "./createWhatsappHarness.js";
 
-export async function createCurrentWhatsappHarness() {
+export async function createCurrentWhatsappHarness({ forwardFromMe = false } = {}) {
   const tempRoot = await fs.mkdtemp(
     path.join(os.tmpdir(), "ridepicker-whatsapp-current-")
   );
@@ -16,6 +16,7 @@ export async function createCurrentWhatsappHarness() {
   return createWhatsappHarnessFromSource({
     source,
     tempRoot,
+    forwardFromMe,
     cleanup: () => fs.rm(tempRoot, { recursive: true, force: true }),
   });
 }
