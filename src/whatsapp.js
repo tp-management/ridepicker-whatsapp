@@ -992,7 +992,9 @@ async function ensureManagedPairingAttempt(
     }
 
     if (session.registered) {
-      stopManagedPairingFlow(flow.sessionId);
+      // The phone accepted the code, but the socket has not opened yet.
+      // Keep the pairing lifecycle active so a pre-open 408/401 is treated
+      // as a failed pairing rather than an ordinary established reconnect.
       return null;
     }
 
@@ -1009,7 +1011,9 @@ async function ensureManagedPairingAttempt(
     }
 
     if (session.registered) {
-      stopManagedPairingFlow(flow.sessionId);
+      // The phone accepted the code, but the socket has not opened yet.
+      // Keep the pairing lifecycle active so a pre-open 408/401 is treated
+      // as a failed pairing rather than an ordinary established reconnect.
       return null;
     }
 
@@ -1816,7 +1820,16 @@ export async function startSession(
         "WhatsApp QR fallback is ready"
       );
 
-      if (managedPairingFlow?.active) {
+      // Baileys may emit stale QR notifications after companion_finish.
+      // They must not reset status or terminate the pending pairing flow.
+      if (session.registered && !session.openedOnce) {
+        logWhatsappEvent(
+          session,
+          "info",
+          "pairing_awaiting_connection",
+          "Phone confirmed pairing; waiting for WhatsApp connection to open"
+        );
+      } else if (managedPairingFlow?.active) {
         session.status = "STARTING";
 
         await persistSessionState(session, {
@@ -2649,10 +2662,14 @@ export async function requestManagedPairingCode(userId, phone = null) {
     }
 
     if (session?.registered) {
-      const error = new Error(
-        "WhatsApp is already connected. Disconnect it before requesting a new pairing code."
+      const trulyConnected =
+        session.status === "CONNECTED" && dbSession.status === "CONNECTED";
+      const error = new Error(trulyConnected
+        ? "WhatsApp is already connected. Disconnect it before requesting a new pairing code."
+        : "Phone confirmed the code, but WhatsApp has not finished connecting. Please wait for the connection result; if it fails, start a fresh link."
       );
       error.status = 409;
+      error.details = { code: trulyConnected ? "ALREADY_CONNECTED" : "PAIRING_FINALIZING" };
       throw error;
     }
   }
