@@ -190,6 +190,10 @@ export async function createWhatsappHarnessFromSource({
       "./whatsapp/selfChatTest.js",
       pathToFileURL(path.join(process.cwd(), "src", "whatsapp", "selfChatTest.js")).href,
     ],
+    [
+      "./whatsapp/contactNames.js",
+      pathToFileURL(path.join(process.cwd(), "src", "whatsapp", "contactNames.js")).href,
+    ],
     ["./whatsapp/logging/baileysLogger.js", "./__stubs__/baileysRawLogger.mjs"],
     ["./whatsapp/auth/supabaseAuthStore.js", "./__stubs__/supabaseAuthStore.mjs"],
     ["./baileysRawLogger.js", "./__stubs__/baileysRawLogger.mjs"],
