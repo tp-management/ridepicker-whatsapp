@@ -21,6 +21,7 @@ import {
 import { repository } from "./repository.js";
 import { writeSystemLog } from "./systemLog.js";
 import { isMarkedSelfChatTestMessage } from "./whatsapp/selfChatTest.js";
+import { createContactNameIndex, reconcileExistingChatNames } from "./whatsapp/contactNames.js";
 import { createBaileysRawLogger } from "./whatsapp/logging/baileysLogger.js";
 import {
   clearSupabaseAuthState,
@@ -1506,8 +1507,10 @@ async function processMessage(session, socket, message) {
 
   if (isGroup) {
     chatName = await getGroupName(socket, chatId);
-  } else if (!fromMe) {
-    chatName = senderName;
+  } else {
+    // Prefer a real address-book name when WhatsApp supplies one.
+    chatName = session.contactNames?.lookup(chatId)?.name ||
+      (!fromMe ? senderName : null);
   }
 
   // Normal outgoing WhatsApp messages stay context-only. Exception:
@@ -1611,6 +1614,7 @@ export async function startSession(
     id,
     userId,
     socket: null,
+    contactNames: createContactNameIndex(),
     qr: null,
     qrIssuedAt: null,
     pairingCode: null,
@@ -2328,6 +2332,77 @@ export async function startSession(
     }
   });
 
+  // Contact-name sync is metadata-only. Only update chats already tracked by
+  // RidePicker. Never save the contact book or historical WhatsApp messages.
+  let contactSyncRunning = false;
+  let contactSyncPending = false;
+  const queueContactNameSync = () => {
+    if (!isCurrentSession(session)) return;
+    contactSyncPending = true;
+    if (contactSyncRunning) return;
+    contactSyncRunning = true;
+    void (async () => {
+      while (contactSyncPending && isCurrentSession(session)) {
+        contactSyncPending = false;
+        const result = await reconcileExistingChatNames(session.contactNames, {
+          listChats: () => repository.listChatNamesForSession(id),
+          updateName: (chatId, name) =>
+            repository.updateExistingChatName({ sessionId: id, chatId, name }),
+          isCurrent: () => isCurrentSession(session),
+        });
+        // Counts only: do not log contacts, phone numbers, or names.
+        if (result.updated) {
+          console.info("[whatsapp] contact names updated", {
+            updated: result.updated,
+            matches: result.matches,
+          });
+        }
+      }
+    })().catch((error) => {
+      console.warn("[whatsapp] contact-name sync failed:", error.message);
+    }).finally(() => {
+      contactSyncRunning = false;
+      if (contactSyncPending && isCurrentSession(session)) queueContactNameSync();
+    });
+  };
+
+  const acceptContacts = (contacts) => {
+    if (!isCurrentSession(session) || !Array.isArray(contacts)) return;
+    let changed = false;
+    let savedNamesSeen = 0;
+    for (const contact of contacts) {
+      if (contact?.name) savedNamesSeen++;
+      changed = session.contactNames.contact(contact) || changed;
+    }
+    // Safe, aggregate-only diagnostic to prove whether WhatsApp delivered
+    // address-book names for an existing linked session.
+    if (contacts.length) {
+      console.info("[whatsapp] contacts event", {
+        received: contacts.length,
+        savedNamesSeen,
+        changed,
+      });
+    }
+    if (changed) queueContactNameSync();
+  };
+  socket.ev.on("contacts.upsert", acceptContacts);
+  socket.ev.on("contacts.update", acceptContacts);
+  socket.ev.on("lid-mapping.update", (mapping) => {
+    if (isCurrentSession(session) && session.contactNames.mapping(mapping)) {
+      queueContactNameSync();
+    }
+  });
+  socket.ev.on("messaging-history.set", (event) => {
+    // Extract contact metadata only. History messages are deliberately ignored.
+    if (!isCurrentSession(session)) return;
+    acceptContacts(event?.contacts);
+    let changed = false;
+    for (const mapping of event?.lidPnMappings || []) {
+      changed = session.contactNames.mapping(mapping) || changed;
+    }
+    if (changed) queueContactNameSync();
+  });
+
   socket.ev.on("messages.upsert", async ({ messages, type }) => {
     if (!isCurrentSession(session)) return;
 
@@ -2341,6 +2416,9 @@ export async function startSession(
 
     for (const message of messages) {
       try {
+        if (session.contactNames.message(message?.key, message?.pushName)) {
+          queueContactNameSync();
+        }
         await processMessage(session, socket, message);
       } catch (error) {
         console.error(

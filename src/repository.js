@@ -807,6 +807,24 @@ export const repository = {
     };
   },
 
+  async listChatNamesForSession(sessionId) {
+    return selectRows("whatsapp_chats", {
+      select: "chat_id,name",
+      session_id: `eq.${sessionId}`,
+      limit: 1000,
+    });
+  },
+
+  async updateExistingChatName({ sessionId, chatId, name }) {
+    if (!name) return null;
+    // PATCH, not INSERT: never create an unrelated WhatsApp chat.
+    const rows = await updateRows("whatsapp_chats", { name }, {
+      session_id: `eq.${sessionId}`,
+      chat_id: `eq.${chatId}`,
+    });
+    return first(rows);
+  },
+
   async upsertChat({
     sessionId,
     chatId,
@@ -814,6 +832,19 @@ export const repository = {
     name,
     lastMessageAt,
   }) {
+    // After a restart a message might contain only a pushName (or no name).
+    // Do not erase an existing human-readable title for that reason. A true
+    // address-book change is applied by updateExistingChatName above.
+    const existing = chatType === "group" ? null : first(
+      await selectRows("whatsapp_chats", {
+        select: "name",
+        session_id: `eq.${sessionId}`,
+        chat_id: `eq.${chatId}`,
+        limit: 1,
+      })
+    );
+    const preservedName = typeof existing?.name === "string" &&
+      existing.name.trim() ? existing.name : null;
     const rows = await insertRows(
       "whatsapp_chats",
       [
@@ -821,7 +852,7 @@ export const repository = {
           session_id: sessionId,
           chat_id: chatId,
           chat_type: chatType,
-          name: name || null,
+          name: preservedName || name || null,
           last_message_at: lastMessageAt || new Date().toISOString(),
         },
       ],
