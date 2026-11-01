@@ -15,12 +15,12 @@ import makeWASocket, {
 
 import {
   N8N_FORWARD_SESSION_EVENTS,
+  N8N_FORWARD_FROM_ME,
   N8N_WEBHOOK_URL,
   SESSION_POLICY_CACHE_MS,
 } from "./config.js";
 import { repository } from "./repository.js";
 import { writeSystemLog } from "./systemLog.js";
-import { isMarkedSelfChatTestMessage } from "./whatsapp/selfChatTest.js";
 import { createBaileysRawLogger } from "./whatsapp/logging/baileysLogger.js";
 import {
   clearSupabaseAuthState,
@@ -1510,21 +1510,11 @@ async function processMessage(session, socket, message) {
     chatName = senderName;
   }
 
-  // Normal outgoing WhatsApp messages stay context-only. Exception:
-  // '#rp-test' messages in this account's verified self-chat may exercise the
-  // real DB -> outbox -> n8n pipeline without involving a second phone.
-  const selfChatTest = isMarkedSelfChatTestMessage({
-    messageKey: message.key,
-    body,
-    socketUser: socket?.user,
-    authMe: socket?.authState?.creds?.me,
-    linkedPhone: policy.whatsapp_phone,
-  });
-
-  // A permitted original message and its outbox entry are one atomic INSERT.
-  // Incoming text/captions OR explicitly marked self-chat tests are queued.
+  // Railway N8N_FORWARD_FROM_ME is the single gate for outgoing messages.
+  // Incoming messages always qualify; an explicit true allows every own message,
+  // including self-chat, without special #rp-test markers.
   const eligibleForAi =
-    Boolean(String(body || "").trim()) && (!fromMe || selfChatTest);
+    Boolean(String(body || "").trim()) && (!fromMe || N8N_FORWARD_FROM_ME);
   let inserted = null;
 
   try {
