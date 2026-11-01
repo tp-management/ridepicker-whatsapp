@@ -109,6 +109,7 @@ export async function createWhatsappHarnessFromSource({
     `const sessionsByUser = new Map();\n` +
       `const sessionsById = new Map();\n` +
       `const activities = [];\n` +
+      `const subscriptionByUser = new Map();\n` +
       `function ensureRow(userId) {\n` +
       `  let row = sessionsByUser.get(userId);\n` +
       `  if (!row) {\n` +
@@ -123,6 +124,7 @@ export async function createWhatsappHarnessFromSource({
       `  async getUserRowById(userId) { return { id: userId, phone_e164: \"+37061234567\" }; },\n` +
       `  async getWhatsappSessionByUser(userId) { return sessionsByUser.get(userId) || null; },\n` +
       `  async getWhatsappSessionById(sessionId) { return sessionsById.get(sessionId) || null; },\n` +
+      `  async getSubscriptionRow(userId) { return subscriptionByUser.get(userId) || { status: "active" }; },\n` +
       `  async listWhatsappSessions() { return Array.from(sessionsById.values()); },\n` +
       `  async updateWhatsappSessionById(sessionId, patch) { const row = sessionsById.get(sessionId); if (!row) return null; Object.assign(row, patch); return row; },\n` +
       `  async updateWhatsappSessionByUser(userId, patch) { const row = ensureRow(userId); Object.assign(row, patch); return row; },\n` +
@@ -135,7 +137,8 @@ export async function createWhatsappHarnessFromSource({
       `};\n` +
       `export function __setSessionStatus(userId, status) { const row = ensureRow(userId); row.status = status; return row; }\n` +
       `export function __getSessionRow(userId) { return ensureRow(userId); }\n` +
-      `export function __getActivities() { return activities; }\n`
+      `export function __getActivities() { return activities; }\n` +
+      `export function __setSubscription(userId, subscription) { subscriptionByUser.set(userId, subscription); }\n`
   );
 
   await writeModule(
