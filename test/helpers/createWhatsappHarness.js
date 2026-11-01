@@ -18,6 +18,7 @@ export async function createWhatsappHarnessFromSource({
   source: sourceInput,
   tempRoot,
   cleanup = async () => {},
+  forwardFromMe = false,
 }) {
   const srcDir = path.join(tempRoot, "src");
   const stubDir = path.join(srcDir, "__stubs__");
@@ -27,7 +28,7 @@ export async function createWhatsappHarnessFromSource({
     stubDir,
     "config.mjs",
       `export const N8N_FORWARD_MEDIA_WITHOUT_TEXT = false;\n` +
-      `export const N8N_FORWARD_FROM_ME = false;\n` +
+      `export const N8N_FORWARD_FROM_ME = ${Boolean(forwardFromMe)};\n` +
       `export const N8N_FORWARD_SESSION_EVENTS = false;\n` +
       `export const N8N_WEBHOOK_URL = \"\";\n` +
       `export const SESSION_POLICY_CACHE_MS = 1000;\n`
@@ -186,10 +187,6 @@ export async function createWhatsappHarnessFromSource({
     ["./systemLog.js", "./__stubs__/systemLog.mjs"],
     ["./supabase.js", "./__stubs__/supabase.mjs"],
     ["./utils.js", "./__stubs__/utils.mjs"],
-    [
-      "./whatsapp/selfChatTest.js",
-      pathToFileURL(path.join(process.cwd(), "src", "whatsapp", "selfChatTest.js")).href,
-    ],
     ["./whatsapp/logging/baileysLogger.js", "./__stubs__/baileysRawLogger.mjs"],
     ["./whatsapp/auth/supabaseAuthStore.js", "./__stubs__/supabaseAuthStore.mjs"],
     ["./baileysRawLogger.js", "./__stubs__/baileysRawLogger.mjs"],
