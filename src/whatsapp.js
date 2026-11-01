@@ -1406,6 +1406,29 @@ async function persistSessionState(session, patch) {
   }
 }
 
+function subscriptionAllowsAssist(subscription, now = Date.now()) {
+  if (subscription?.status === "active") return true;
+  return subscription?.status === "cancelled"
+    && Boolean(subscription.current_period_end)
+    && new Date(subscription.current_period_end).getTime() > now;
+}
+
+// A fresh WhatsApp link has no previously confirmed connected_at. Transient
+// reconnects, Railway deployments, and socket replacements keep that timestamp
+// and must never override a user's manual Assist OFF choice.
+async function shouldEnableAssistOnFreshLink(session) {
+  if (!session?.userId) return false;
+  try {
+    const durable = await repository.getWhatsappSessionById(session.id);
+    if (!durable || durable.user_id !== session.userId || durable.connected_at) return false;
+    const subscription = await repository.getSubscriptionRow(session.userId);
+    return subscriptionAllowsAssist(subscription);
+  } catch (error) {
+    console.warn(`[${session.id}] Could not check Assist subscription for WhatsApp link:`, error?.message);
+    return false;
+  }
+}
+
 async function addSessionActivity(session, title, detail = "") {
   if (!session?.userId || !isSupabaseConfigured()) {
     return;
@@ -1871,6 +1894,7 @@ export async function startSession(
 
       const account = socketAccount(socket);
       const connectedAt = new Date().toISOString();
+      const autoEnableAssist = await shouldEnableAssistOnFreshLink(session);
 
       console.log(`[${id}] WhatsApp connected`);
       logWhatsappEvent(
@@ -1886,7 +1910,22 @@ export async function startSession(
         display_name: account.name,
         connected_at: connectedAt,
         last_seen_at: connectedAt,
+        ...(autoEnableAssist ? { bot_mode: "assist" } : {}),
       });
+
+      if (autoEnableAssist && persistedConnection?.bot_mode === "assist") {
+        logWhatsappEvent(
+          session,
+          "info",
+          "assist_auto_enabled_on_link",
+          "RidePicker Assist enabled automatically after WhatsApp linking"
+        );
+        await addSessionActivity(
+          session,
+          "RidePicker Assist enabled",
+          "Activated automatically after WhatsApp linking."
+        );
+      }
 
       session.durableConnectedAt =
         persistedConnection?.connected_at || connectedAt;
