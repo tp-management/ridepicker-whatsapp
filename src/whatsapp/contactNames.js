@@ -2,8 +2,8 @@
 // except names on existing RidePicker whatsapp_chats rows.
 const jid = (id) => {
   if (typeof id !== "string") return null;
-  const value = id.trim().replace(/@c\\.us$/, "@s.whatsapp.net");
-  return /^[^@\\s]+@(lid|s\\.whatsapp\\.net)$/.test(value) ? value : null;
+  const value = id.trim().replace(/@c\.us$/, "@s.whatsapp.net");
+  return /^[^@\s]+@(lid|s\.whatsapp\.net)$/.test(value) ? value : null;
 };
 const display = (value) =>
   typeof value === "string" && value.trim() ? value.trim().slice(0, 250) : null;
