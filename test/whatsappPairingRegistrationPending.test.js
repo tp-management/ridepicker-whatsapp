@@ -41,6 +41,8 @@ test("registered credentials are not a connected WhatsApp session", async t => {
     h.whatsapp.requestManagedPairingCode("registered-not-open", "+37061234567"),
     e => e?.status === 409 && e?.details?.code === "PAIRING_FINALIZING"
       && !e.message.includes("already connected")
+      && !e.message.includes("Phone confirmed")
+      && e.message.includes("connection is not confirmed yet")
   );
   assert.equal(flow.active, true, "requesting code while finalizing must not stop flow");
 
