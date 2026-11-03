@@ -1757,12 +1757,10 @@ export async function startSession(
     if (!wasRegistered && session.registered) {
       const pairingFlow = managedPairingFlows.get(id) || null;
 
-      // The phone has consumed the pairing code. From this moment the code is
-      // no longer useful to the user, even though the socket may still need a
-      // 515 restart before reaching connection=open. Hide it immediately and
-      // cancel the wall-clock rotation timer. If Baileys later reports 408,
-      // that transport event is the authoritative expiry signal and a fresh
-      // code is generated immediately.
+      // Baileys has marked auth credentials as registered. This means pairing
+      // progressed, NOT that WhatsApp confirmed a working phone connection.
+      // Hide the code while waiting for connection=open; the socket may still
+      // require a 515 restart. A later 408 is handled by pairing recovery.
       if (pairingFlow?.active) {
         if (pairingFlow.rotateTimer) {
           clearTimeout(pairingFlow.rotateTimer);
@@ -1778,8 +1776,8 @@ export async function startSession(
         logWhatsappEvent(
           session,
           "info",
-          "pairing_code_consumed",
-          "WhatsApp pairing code was consumed by the phone"
+          "pairing_code_hidden",
+          "Pairing code hidden after Baileys registered credentials; connection not yet confirmed"
         );
       }
 
@@ -1827,7 +1825,7 @@ export async function startSession(
           session,
           "info",
           "pairing_awaiting_connection",
-          "Phone confirmed pairing; waiting for WhatsApp connection to open"
+          "Baileys credentials registered; waiting for WhatsApp connection to open"
         );
       } else if (managedPairingFlow?.active) {
         session.status = "STARTING";
@@ -2666,7 +2664,7 @@ export async function requestManagedPairingCode(userId, phone = null) {
         session.status === "CONNECTED" && dbSession.status === "CONNECTED";
       const error = new Error(trulyConnected
         ? "WhatsApp is already connected. Disconnect it before requesting a new pairing code."
-        : "Phone confirmed the code, but WhatsApp has not finished connecting. Please wait for the connection result; if it fails, start a fresh link."
+        : "WhatsApp credentials were registered, but the connection is not confirmed yet. Please wait for the connection result; if it fails, start a fresh link."
       );
       error.status = 409;
       error.details = { code: trulyConnected ? "ALREADY_CONNECTED" : "PAIRING_FINALIZING" };
